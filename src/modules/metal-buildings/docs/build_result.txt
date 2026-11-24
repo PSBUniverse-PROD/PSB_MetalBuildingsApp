@@ -1,0 +1,51 @@
+﻿
+> psbuniverse@0.1.0 prebuild
+> node scripts/generate-routes.js
+
+Generating route files...
+
+
+Done. 0 written, 13 unchanged.
+
+
+> psbuniverse@0.1.0 build
+> next build
+
+Γû▓ Next.js 16.2.4 (Turbopack)
+- Environments: .env.local
+
+  Creating an optimized production build ...
+Γ£ô Compiled successfully in 8.6s
+  Running TypeScript ...
+  Finished TypeScript in 178ms ...
+  Collecting page data using 3 workers ...
+  Generating static pages using 3 workers (0/4) ...
+  Generating static pages using 3 workers (1/4) 
+  Generating static pages using 3 workers (2/4) 
+  Generating static pages using 3 workers (3/4) 
+Γ£ô Generating static pages using 3 workers (4/4) in 345ms
+  Finalizing page optimization ...
+
+Route (app)
+Γöî Γùï /
+Γö£ Γùï /_not-found
+Γö£ ╞Æ /admin/application-setup
+Γö£ ╞Æ /admin/card-module-setup
+Γö£ ╞Æ /admin/company-department-setup
+Γö£ ╞Æ /admin/status-setup
+Γö£ ╞Æ /admin/user-master-setup
+Γö£ ╞Æ /metal-buildings
+Γö£ ╞Æ /metal-buildings/pricing
+Γö£ ╞Æ /psbpages/dashboard
+Γö£ ╞Æ /psbpages/documentation
+Γö£ ╞Æ /psbpages/examples
+Γö£ ╞Æ /psbpages/examples/data-table
+Γö£ ╞Æ /psbpages/login
+Γöö ╞Æ /psbpages/profile
+
+
+╞Æ Proxy (Middleware)
+
+Γùï  (Static)   prerendered as static content
+╞Æ  (Dynamic)  server-rendered on demand
+

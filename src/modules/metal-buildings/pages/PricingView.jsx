@@ -1,0 +1,3605 @@
+"use client";
+
+import { useState, useEffect, useMemo, useCallback, useRef } from "react";
+import { Button, Card, Badge, Modal, Input, TableZ, TABLE_FILTER_TYPES, createFilterConfig, toastSuccess, toastError } from "@/shared/components/ui";
+import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
+import { faTableCells, faTags, faPlus, faBan, faTrash, faCheck, faSync, faPen, faChevronDown } from "@fortawesome/free-solid-svg-icons";
+import { formatCurrency, formatCurrencyInput, parseCurrencyInput } from "../data/metalBuildings.data";
+import {
+  loadMatrixPrices,
+  loadRates,
+  loadOptions,
+  createFeature,
+  updateFeature,
+  deleteFeature,
+  upsertMatrixPrice,
+  deleteMatrixPrice,
+  upsertRate,
+  deleteRate,
+  upsertOption,
+  deleteOption,
+  bulkLoadRegionFeatureOption,
+  insertRegionFeatureOption,
+  deleteRegionFeatureOption,
+  loadPanelPricing,
+  loadPanelTypes,
+  upsertPanelPricing,
+  deletePanelPricing,
+  bulkLoadRegionPanelPriceMatrix,
+  insertRegionPanelPriceMatrix,
+  deleteRegionPanelPriceMatrix,
+  loadColorGroups,
+  loadColorOptions,
+  upsertColorGroup,
+  deleteColorGroup,
+  upsertColorOption,
+  deleteColorOption,
+  bulkLoadRegionPriceMatrix,
+  insertRegionPriceMatrix,
+  deleteRegionPriceMatrix,
+  loadLegHeightPrices,
+  upsertLegHeightPrice,
+  deleteLegHeightPrice,
+  bulkLoadRegionLegPriceMatrix,
+  insertRegionLegPriceMatrix,
+  deleteRegionLegPriceMatrix,
+  loadDoorWindowItems,
+  loadDoorWindowItemsByType,
+  upsertDoorWindowItem,
+  deleteDoorWindowItem,
+  bulkLoadRegionDoorWindow,
+  insertRegionDoorWindow,
+  deleteRegionDoorWindow,
+  loadSnowLoadRates,
+  createSnowLoadRate,
+  updateSnowLoadRate,
+  deleteSnowLoadRate,
+} from "../data/metalBuildings.actions";
+import "./pricing.css";
+
+// Roof Style is now a fixed selection of panel orientations.
+const ROOF_STYLE_OPTIONS = ["Horizontal", "Vertical"];
+
+// Siding Style is a fixed selection of panel orientations.
+const SIDING_STYLE_OPTIONS = ["Horizontal", "Vertical"];
+
+// Renders the dropdown options; keeps any pre-existing/legacy free-text value
+// (e.g. "Regular", "A-Frame") visible so admins can see it and switch it.
+function roofStyleOptions(currentValue) {
+  const options = [...ROOF_STYLE_OPTIONS];
+  const current = String(currentValue ?? "").trim();
+  if (current && !options.includes(current)) options.push(current);
+  return options;
+}
+
+function formatRegionNames(regions, regionIds) {
+  const selected = new Set(regionIds ?? []);
+  if (selected.size === 0) return "All regions";
+  return regions
+    .filter((r) => selected.has(r.region_id))
+    .map((r) => `${r.name} (${r.state_code})`)
+    .join(", ");
+}
+
+function formatRegionCodes(regions, regionIds) {
+  const selected = new Set(regionIds ?? []);
+  if (selected.size === 0) return "All regions";
+  return regions
+    .filter((r) => selected.has(r.region_id))
+    .map((r) => r.state_code)
+    .join(", ");
+}
+
+function formatPanelWidthRange(row) {
+  const width = row?.width != null ? String(row.width) : null;
+  const maxWidth = row?.max_width != null ? String(row.max_width) : null;
+  if (width == null && maxWidth == null) return "—";
+  if (maxWidth != null && maxWidth !== width) return `${width ?? maxWidth}-${maxWidth}`;
+  return width ?? maxWidth;
+}
+
+function RowViewModal({ show, onHide, title, fields }) {
+  return (
+    <Modal title={title} show={show} onHide={onHide} footer={<Button size="sm" onClick={onHide}>Close</Button>}>
+      {fields && fields.length > 0 ? (
+        <div className="row g-3">
+          {fields.map((f) => (
+            <div key={f.label} className={f.full ? "col-12" : "col-6"}>
+              <div className="text-muted small text-uppercase" style={{ fontSize: "0.68rem", letterSpacing: "0.04em", fontWeight: 600 }}>{f.label}</div>
+              <div className="text-break">{f.value ?? "—"}</div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p className="text-muted mb-0">No details available.</p>
+      )}
+    </Modal>
+  );
+}
+
+// ─── SIDEBAR ORDERING HELPERS ──────────────────────────────
+// Feature items follow metal_s_feature.sort_order ("Sort" column); group headers
+// follow the feature category sort column (metal_s_category.sort_order).
+
+function featureSortOrder(feature) {
+  const value = Number(feature?.sort_order);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function compareFeaturesBySortOrder(a, b) {
+  const d = featureSortOrder(a) - featureSortOrder(b);
+  if (d !== 0) return d;
+  const n = String(a?.name ?? "").localeCompare(String(b?.name ?? ""));
+  if (n !== 0) return n;
+  return Number(a?.feature_id ?? 0) - Number(b?.feature_id ?? 0);
+}
+
+function categorySortOrder(category) {
+  const value = Number(category?.sort_order);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function compareCategoriesBySortOrder(a, b) {
+  const d = categorySortOrder(a) - categorySortOrder(b);
+  return d !== 0 ? d : String(a?.name ?? "").localeCompare(String(b?.name ?? ""));
+}
+
+export default function PricingView({ features: initialFeatures, styles, pricingTypes: pricingTypesData, categories: categoriesData, regions, legTypes, framings }) {
+  const [features, setFeatures] = useState(initialFeatures);
+  const [selectedId, setSelectedId] = useState(features[0]?.feature_id ?? null);
+  const [search, setSearch] = useState("");
+  const [collapsedGroups, setCollapsedGroups] = useState(new Set());
+
+  const pricingTypes = useMemo(() => pricingTypesData ?? [], [pricingTypesData]);
+  const categories = useMemo(() => categoriesData ?? [], [categoriesData]);
+
+  const toggleGroup = useCallback((category) => {
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(category)) next.delete(category);
+      else next.add(category);
+      return next;
+    });
+  }, []);
+
+  const filtered = features.filter((f) => {
+    return f.name.toLowerCase().includes(search.toLowerCase()) || (f.category_name || "").toLowerCase().includes(search.toLowerCase());
+  });
+
+  const grouped = useMemo(() => {
+    const map = {};
+    for (const f of filtered) {
+      const key = f.category_name && f.category_name !== "—" ? f.category_name : "Uncategorized";
+      if (!map[key]) map[key] = [];
+      map[key].push(f);
+    }
+    // Features inside each group follow metal_s_feature.sort_order ("Sort" column).
+    for (const items of Object.values(map)) items.sort(compareFeaturesBySortOrder);
+    // Group headers follow the feature category sort column (metal_s_category.sort_order).
+    // Groups without a matching category (e.g. "Uncategorized") render after known
+    // categories, ordered by their lowest feature sort_order.
+    const categoryRanks = new Map(
+      [...categories].sort(compareCategoriesBySortOrder).map((c, i) => [c.name, i]),
+    );
+    return Object.entries(map).sort(([keyA, itemsA], [keyB, itemsB]) => {
+      const rankA = categoryRanks.has(keyA) ? categoryRanks.get(keyA) : Number.MAX_SAFE_INTEGER;
+      const rankB = categoryRanks.has(keyB) ? categoryRanks.get(keyB) : Number.MAX_SAFE_INTEGER;
+      if (rankA !== rankB) return rankA - rankB;
+      const minA = Math.min(...itemsA.map(featureSortOrder));
+      const minB = Math.min(...itemsB.map(featureSortOrder));
+      if (minA !== minB) return minA - minB;
+      return keyA.localeCompare(keyB);
+    });
+  }, [filtered, categories]);
+
+  const selected = features.find((f) => f.feature_id === selectedId) ?? null;
+
+  return (
+    <div className="pricing-wrap">
+      {/* ─── Sidebar ─── */}
+      <aside className="pricing-sidebar">
+        <div className="pricing-sidebar-header">
+          <p className="pricing-sidebar-title">Features</p>
+          <AddFeatureButton pricingTypes={pricingTypes} categories={categories} onCreated={(f) => { setFeatures((prev) => [...prev, f]); setSelectedId(f.feature_id); }} />
+        </div>
+
+        <div className="pricing-sidebar-search">
+          <input placeholder="Search…" value={search} onChange={(e) => setSearch(e.target.value)} />
+        </div>
+
+        <div className="pricing-sidebar-list">
+          {grouped.map(([category, items]) => {
+            const isCollapsed = collapsedGroups.has(category);
+            return (
+              <div key={category} className="pricing-group">
+                <button
+                  type="button"
+                  className={`pricing-group-header${isCollapsed ? " collapsed" : ""}`}
+                  onClick={() => toggleGroup(category)}
+                  aria-expanded={!isCollapsed}
+                >
+                  <FontAwesomeIcon icon={faChevronDown} className="pricing-group-chevron" />
+                  <FontAwesomeIcon icon={faTags} className="pricing-group-icon" />
+                  <span className="pricing-group-label">{category}</span>
+                  <span className="pricing-group-count">{items.length}</span>
+                </button>
+                {!isCollapsed && items.map((f) => (
+                  <button
+                    key={f.feature_id}
+                    className={`pricing-nav-item${selectedId === f.feature_id ? " active" : ""}`}
+                    onClick={() => setSelectedId(f.feature_id)}
+                  >
+                    <span className="nav-label">{f.name}</span>
+                  </button>
+                ))}
+              </div>
+            );
+          })}
+        </div>
+
+
+      </aside>
+
+      {/* ─── Main ─── */}
+      <main className="pricing-main">
+        {selected ? (
+          <FeatureDetail
+            key={selected.feature_id}
+            feature={selected}
+            styles={styles}
+            regions={regions}
+            legTypes={legTypes}
+            framings={framings}
+            categories={categories}
+            pricingTypes={pricingTypes}
+            onUpdated={(f) => setFeatures((prev) => prev.map((x) => x.feature_id === f.feature_id ? f : x))}
+            onDeleted={(id) => { setFeatures((prev) => prev.filter((x) => x.feature_id !== id)); setSelectedId(null); }}
+          />
+        ) : (
+          <div className="pricing-empty">
+            <FontAwesomeIcon icon={faTableCells} className="pricing-empty-icon" />
+            <span className="pricing-empty-text">Select a feature to view pricing</span>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
+
+// ─── FEATURE DETAIL ────────────────────────────────────────
+
+function FeatureDetail({ feature, styles, regions, legTypes, framings, categories, pricingTypes, onUpdated, onDeleted }) {
+  const [matrixPrices, setMatrixPrices] = useState([]);
+  const [rates, setRates] = useState([]);
+  const [options, setOptions] = useState([]);
+  const [panelPricing, setPanelPricing] = useState([]);
+  const [colorGroups, setColorGroups] = useState([]);
+  const [doorWindowItems, setDoorWindowItems] = useState([]);
+  const [snowRows, setSnowRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const contentRef = useRef(null);
+
+  // ─── Feature detection ────────────────────────────────────
+  const isRoofStyleFeature = feature?.name?.toLowerCase().trim() === "roof style";
+  // The DB row currently ships the legacy spelling "Leg Heigt".
+  const normFeatureName = feature?.name?.toLowerCase().replace(/\s+/g, " ").trim();
+  const isLegHeightFeature = ["leg height", "base structure leg height", "building leg height", "base structure leg", "attached lean leg"].includes(normFeatureName);
+  const isRollupDoorFeature = normFeatureName === "rollup door" || normFeatureName === "garage door";
+  const isDoorFeature = normFeatureName === "door" || normFeatureName === "walk-in door";
+  const isRoofPitchFeature = feature?.render_key === "roof_pitch";
+  const isRoofOverhangFeature = feature?.render_key === "roof_overhang";
+  const isWindowFeature = normFeatureName === "window" || normFeatureName === "windows";
+  const isCustomFrameoutFeature = normFeatureName === "custom frameout" || normFeatureName === "frameout" || normFeatureName === "frame out";
+  const isInstallationSurfaceFeature = normFeatureName === "installation surface" || feature?.render_key === "installation_surface";
+  const isConcreteSealantFeature = normFeatureName === "concrete sealant";
+  const isInsulationMaterialFeature = normFeatureName === "insulation material";
+  const isColoredScrewsFeature = normFeatureName === "colored screws";
+  const isFrameGaugeFeature = normFeatureName === "frame gauge";
+  const isOtherFeesFeature = normFeatureName === "other fees";
+  // "Connection Fee" — its own feature (category "Sides & Ends"). Its options are
+  // the length-bucketed connection fees ("Connection Fee (0-20)", …), each of which
+  // can be region-scoped via metal_m_region_feature_option.
+  const isConnectionFeeFeature = normFeatureName === "connection fee" || normFeatureName === "connection fees";
+  // "Panel" — the PER_WALL feature (options in metal_s_feature_option); region-scoped
+  // via metal_m_region_feature_option like the connection fee.
+  const isPanelFeature = normFeatureName === "panel" || normFeatureName === "panels";
+  const isAnchorPackageFeature = normFeatureName === "anchor package";
+  const isTrussesFeature = normFeatureName === "trusses";
+  const isGutterDownspoutFeature = /gutter|downspout/.test(normFeatureName);
+  const isSnowLoadFeature = normFeatureName === "snow load";
+  const isLeanFeature = /lean/.test(normFeatureName) || /lean/.test(String(feature?.category_name ?? "").toLowerCase());
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    (async () => {
+      try {
+        if (isSnowLoadFeature) {
+          const data = await loadSnowLoadRates();
+          if (!cancelled) setSnowRows(data);
+        } else if (feature.pricing_type === "MATRIX") {
+          const data = isLegHeightFeature ? await loadLegHeightPrices(feature.feature_id) : await loadMatrixPrices(feature.feature_id);
+          if (!cancelled) setMatrixPrices(data);
+        } else if (feature.pricing_type === "PANEL") {
+          const data = await loadPanelPricing(feature.feature_id);
+          if (!cancelled) setPanelPricing(data);
+        } else if (feature.pricing_type === "RATE") {
+          const data = await loadRates(feature.feature_id);
+          if (!cancelled) setRates(data);
+        } else if (feature.pricing_type === "COLOR") {
+          const data = await loadColorGroups(feature.feature_id);
+          if (!cancelled) setColorGroups(data);
+        } else if (feature.pricing_type === "PER_ITEM") {
+          const data = await loadDoorWindowItems(feature.feature_id);
+          if (!cancelled) setDoorWindowItems(data);
+        } else if (isRollupDoorFeature) {
+          const data = await loadDoorWindowItemsByType("rollup_door");
+          if (!cancelled) setDoorWindowItems(data);
+        } else if (isDoorFeature) {
+          const data = await loadDoorWindowItemsByType("door");
+          if (!cancelled) setDoorWindowItems(data);
+        } else {
+          const data = await loadOptions(feature.feature_id);
+          if (!cancelled) setOptions(data);
+        }
+      } catch (err) {
+        toastError(err.message);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [feature.feature_id, feature.pricing_type, isLegHeightFeature, isRollupDoorFeature, isDoorFeature, isSnowLoadFeature]);
+
+  // Keep the sticky table header offset equal to the height of the sticky
+  // filter toolbar so the header sits just below the filters.
+  useEffect(() => {
+    const content = contentRef.current;
+    if (!content) return;
+
+    let resizeObserver = null;
+    let observedShell = null;
+
+    const updateHeight = () => {
+      if (observedShell) {
+        content.style.setProperty("--pricing-filter-height", `${observedShell.offsetHeight}px`);
+      } else {
+        content.style.setProperty("--pricing-filter-height", "0px");
+      }
+    };
+
+    const connectResizeObserver = (shell) => {
+      if (resizeObserver) resizeObserver.disconnect();
+      observedShell = shell;
+      resizeObserver = new ResizeObserver(updateHeight);
+      resizeObserver.observe(shell);
+      updateHeight();
+    };
+
+    const mutationObserver = new MutationObserver(() => {
+      const shell = content.querySelector(".psb-ui-table-filters-shell--sticky");
+      if (shell && shell !== observedShell) {
+        connectResizeObserver(shell);
+      } else if (!shell && observedShell) {
+        resizeObserver.disconnect();
+        observedShell = null;
+        content.style.setProperty("--pricing-filter-height", "0px");
+      }
+    });
+
+    mutationObserver.observe(content, { childList: true, subtree: true });
+
+    const initialShell = content.querySelector(".psb-ui-table-filters-shell--sticky");
+    if (initialShell) connectResizeObserver(initialShell);
+
+    return () => {
+      mutationObserver.disconnect();
+      if (resizeObserver) resizeObserver.disconnect();
+      content.style.removeProperty("--pricing-filter-height");
+    };
+  }, []);
+
+  const toggleActive = async () => {
+    try {
+      const updated = await updateFeature(feature.feature_id, { is_active: !feature.is_active });
+      onUpdated(updated);
+      toastSuccess(`${feature.name} ${updated.is_active ? "activated" : "deactivated"}`);
+    } catch (err) {
+      toastError(err.message);
+    }
+  };
+
+  const handleDelete = async () => {
+    try {
+      await deleteFeature(feature.feature_id);
+      toastSuccess(`Feature "${feature.name}" deleted`);
+      onDeleted(feature.feature_id);
+    } catch (err) {
+      toastError(err.message);
+    }
+  };
+
+  const itemCount = isSnowLoadFeature ? snowRows.length
+    : feature.pricing_type === "MATRIX" ? matrixPrices.length
+    : feature.pricing_type === "PANEL" ? panelPricing.length
+    : feature.pricing_type === "COLOR" ? colorGroups.length
+    : feature.pricing_type === "RATE" ? rates.length
+    : (feature.pricing_type === "PER_ITEM" || isRollupDoorFeature || isDoorFeature) ? doorWindowItems.length
+    : options.length;
+
+  return (
+    <>
+      {/* Topbar */}
+      <div className="pricing-topbar">
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div>
+            <p className="pricing-page-title">{feature.name}</p>
+            <div className="pricing-detail-meta">
+              <p className="pricing-page-sub">{feature.category_name} &middot; {feature.pricing_type_label || feature.pricing_type}</p>
+              <span className={`pricing-status-dot ${feature.is_active ? "active" : "inactive"}`} title={feature.is_active ? "Active" : "Inactive"} />
+            </div>
+          </div>
+        </div>
+        <div className="pricing-actions-bar">
+          <EditFeatureButton
+            key={feature.feature_id}
+            feature={feature}
+            categories={categories}
+            pricingTypes={pricingTypes}
+            onUpdated={onUpdated}
+          />
+          <Button size="sm" variant="ghost" onClick={toggleActive} title={feature.is_active ? "Deactivate" : "Activate"}>
+            <FontAwesomeIcon icon={feature.is_active ? faBan : faCheck} />
+          </Button>
+          {!confirmDelete ? (
+            <Button size="sm" variant="ghost" onClick={() => setConfirmDelete(true)} title="Delete feature">
+              <FontAwesomeIcon icon={faTrash} />
+            </Button>
+          ) : (
+            <>
+              <Button variant="danger" size="sm" onClick={handleDelete}>Confirm</Button>
+              <Button variant="secondary" size="sm" onClick={() => setConfirmDelete(false)}>Cancel</Button>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Content */}
+      <div className="pricing-content" ref={contentRef}>
+        {loading ? (
+          <p className="text-muted small">Loading pricing data…</p>
+        ) : isSnowLoadFeature ? (
+          <SnowLoadEditor rows={snowRows} onRefresh={async () => setSnowRows(await loadSnowLoadRates())} />
+        ) : (
+          <>
+            {feature.pricing_type === "MATRIX" && isRoofStyleFeature && (
+              <RoofStyleMatrixEditor featureId={feature.feature_id} prices={matrixPrices} styles={styles} regions={regions} onRefresh={async () => setMatrixPrices(await loadMatrixPrices(feature.feature_id))} />
+            )}
+            {feature.pricing_type === "MATRIX" && isLegHeightFeature && (
+              <LegHeightMatrixEditor featureId={feature.feature_id} prices={matrixPrices} legTypes={legTypes} regions={regions} onRefresh={async () => setMatrixPrices(await loadLegHeightPrices(feature.feature_id))} />
+            )}
+            {feature.pricing_type === "MATRIX" && !isRoofStyleFeature && !isLegHeightFeature && (
+              <MatrixEditor featureId={feature.feature_id} prices={matrixPrices} styles={styles} regions={regions} framings={framings} isLeanFeature={isLeanFeature} onRefresh={async () => setMatrixPrices(await loadMatrixPrices(feature.feature_id))} />
+            )}
+            {feature.pricing_type === "PANEL" && <PanelEditor featureId={feature.feature_id} panelPricing={panelPricing} regions={regions} onRefresh={async () => setPanelPricing(await loadPanelPricing(feature.feature_id))} />}
+            {feature.pricing_type === "RATE" && <RateEditor featureId={feature.feature_id} rates={rates} onRefresh={async () => setRates(await loadRates(feature.feature_id))} />}
+            {feature.pricing_type === "COLOR" && <ColorEditor featureId={feature.feature_id} groups={colorGroups} onRefresh={async () => setColorGroups(await loadColorGroups(feature.feature_id))} />}
+            {feature.pricing_type === "PER_ITEM" && <DoorWindowEditor featureId={feature.feature_id} items={doorWindowItems} regions={regions} onRefresh={async () => setDoorWindowItems(await loadDoorWindowItems(feature.feature_id))} />}
+            {isRollupDoorFeature && <DoorWindowEditor featureId={feature.feature_id} items={doorWindowItems} regions={regions} fixedType="rollup_door" onRefresh={async () => setDoorWindowItems(await loadDoorWindowItemsByType("rollup_door"))} />}
+            {isDoorFeature && <DoorWindowEditor featureId={feature.feature_id} items={doorWindowItems} regions={regions} fixedType="door" onRefresh={async () => setDoorWindowItems(await loadDoorWindowItemsByType("door"))} />}
+            {!["MATRIX", "PANEL", "RATE", "COLOR", "PER_ITEM"].includes(feature.pricing_type) && !isRollupDoorFeature && !isDoorFeature && <OptionsEditor featureId={feature.feature_id} options={options} isMultiplier={isRoofPitchFeature || isRoofOverhangFeature} allowedDimensions={(isInstallationSurfaceFeature || isConcreteSealantFeature || isInsulationMaterialFeature || isColoredScrewsFeature || isFrameGaugeFeature || isOtherFeesFeature || isTrussesFeature || isGutterDownspoutFeature) ? [] : isRoofOverhangFeature ? ["width", "length"] : isWindowFeature ? ["width", "height"] : isCustomFrameoutFeature ? ["width", "height"] : isAnchorPackageFeature ? ["width", "length"] : undefined} singleValueDimensions={(isWindowFeature || isCustomFrameoutFeature) ? ["width", "height"] : []} regions={regions} enableRegions={isCustomFrameoutFeature || isConnectionFeeFeature || isOtherFeesFeature || isPanelFeature} regionPredicate={isOtherFeesFeature ? (o) => /connection/i.test(String(o?.name ?? "")) : null} dimensionsBeforePrice={isCustomFrameoutFeature} hideName={isAnchorPackageFeature} featureName={feature.name} onRefresh={async () => setOptions(await loadOptions(feature.feature_id))} />}
+          </>
+        )}
+      </div>
+
+      {/* Footer */}
+      {!loading && (
+        <div className="pricing-footer">
+          <span className="pricing-footer-text">{itemCount} {itemCount === 1 ? "row" : "rows"}</span>
+          <span className={`pricing-type-badge ${feature.pricing_type.toLowerCase()}`}>{feature.pricing_type}</span>
+        </div>
+      )}
+    </>
+  );
+}
+
+// ─── ROOF STYLE MATRIX EDITOR ────────────────────────────────
+
+function roofStyleRowLabel(row) {
+  const style = row?.roof_stye?.trim() || "—";
+  const fmt = (min, max, unit) => {
+    if (min != null && max != null) return `${min}–${max} ${unit}`;
+    if (min != null) return `${min} ${unit}`;
+    if (max != null) return `up to ${max} ${unit}`;
+    return null;
+  };
+  const dims = [fmt(row?.width, row?.width_max, "W"), fmt(row?.length, row?.length_max, "L")].filter(Boolean);
+  return dims.length ? `${style} (${dims.join(" x ")})` : style;
+}
+
+function RoofStyleMatrixEditor(props) {
+  // Keep the table mounted so its filter/sort/pagination state survives
+  // data refreshes (e.g. after adding a row). Form state resets are handled
+  // explicitly inside RoofStyleMatrixTable after each save/cancel.
+  return <RoofStyleMatrixTable {...props} />;
+}
+
+function RoofStyleMatrixTable({ featureId, prices, regions, onRefresh }) {
+  const [editingId, setEditingId] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [addOpen, setAddOpen] = useState(false);
+  const [viewRow, setViewRow] = useState(null);
+
+  const [addForm, setAddForm] = useState({
+    roof_stye: "",
+    width: "", length: "", width_max: "", length_max: "", base_price: "", selectedRegionIds: [],
+  });
+  const [editForm, setEditForm] = useState({
+    roof_stye: "", width: "", length: "", width_max: "", length_max: "", base_price: "", selectedRegionIds: [],
+  });
+
+  // ─── Region mappings ──────────────────────────────────────
+  const [regionSelections, setRegionSelections] = useState({});
+  const originalRegionRef = useRef({});
+
+  useEffect(() => {
+    let cancelled = false;
+    const realIds = prices
+      .filter((p) => typeof p.matrix_price_id === "number" && p.matrix_price_id > 0)
+      .map((p) => p.matrix_price_id);
+    if (realIds.length === 0) return;
+    (async () => {
+      try {
+        const map = await bulkLoadRegionPriceMatrix(realIds);
+        if (cancelled) return;
+        originalRegionRef.current = { ...map };
+        setRegionSelections((prev) => {
+          const next = { ...prev };
+          for (const id of realIds) {
+            next[id] = [...(map[id] ?? [])];
+          }
+          return next;
+        });
+      } catch (err) { /* silently fail */ }
+    })();
+    return () => { cancelled = true; };
+  }, [prices]);
+
+  // ─── ADD ───────────────────────────────────────────────────
+
+  const handleAdd = useCallback(async () => {
+    const base_price = parseFloat(parseCurrencyInput(addForm.base_price));
+    if (isNaN(base_price) || base_price <= 0) { toastError("Base Price is required"); return; }
+    if (!addForm.roof_stye.trim()) { toastError("Roof Style is required"); return; }
+
+    setSaving(true);
+    try {
+      const result = await upsertMatrixPrice({
+        feature_id: featureId,
+        width: addForm.width ? parseInt(addForm.width) : null,
+        length: addForm.length ? parseInt(addForm.length) : null,
+        height: null,
+        width_max: addForm.width_max ? parseInt(addForm.width_max) : null,
+        length_max: addForm.length_max ? parseInt(addForm.length_max) : null,
+        roof_stye: addForm.roof_stye.trim(),
+        base_price,
+        leg_height_price: 0,
+        enclosed_sides_price: 0,
+        enclosed_ends_price: 0,
+      });
+
+      const realId = result?.matrix_price_id;
+      if (realId && addForm.selectedRegionIds.length > 0) {
+        for (const regionId of addForm.selectedRegionIds) {
+          await insertRegionPriceMatrix(regionId, realId);
+        }
+      }
+
+      toastSuccess("Price added");
+      setAddForm({
+        roof_stye: "",
+        width: "", length: "", width_max: "", length_max: "", base_price: "", selectedRegionIds: [],
+      });
+      setAddOpen(false);
+      await onRefresh();
+    } catch (err) { toastError(err.message); }
+    finally { setSaving(false); }
+  }, [addForm, featureId, onRefresh]);
+
+  // ─── EDIT ───────────────────────────────────────────────────
+
+  const handleStartEdit = useCallback((row) => {
+    setEditingId(row.matrix_price_id);
+    const regIds = regionSelections[row.matrix_price_id] ?? originalRegionRef.current[String(row.matrix_price_id)] ?? [];
+    setEditForm({
+      roof_stye: row.roof_stye ?? "",
+      width: row.width ?? "",
+      length: row.length ?? "",
+      width_max: row.width_max ?? "",
+      length_max: row.length_max ?? "",
+      base_price: row.base_price ?? "",
+      selectedRegionIds: [...regIds],
+    });
+  }, [regionSelections]);
+
+  const handleSave = useCallback(async () => {
+    const base_price = parseFloat(parseCurrencyInput(editForm.base_price));
+    if (isNaN(base_price) || base_price <= 0) { toastError("Base Price is required"); return; }
+    if (!editForm.roof_stye.trim()) { toastError("Roof Style is required"); return; }
+
+    setSaving(true);
+    try {
+      await upsertMatrixPrice({
+        matrix_price_id: editingId,
+        feature_id: featureId,
+        width: editForm.width ? parseInt(editForm.width) : null,
+        length: editForm.length ? parseInt(editForm.length) : null,
+        height: null,
+        width_max: editForm.width_max ? parseInt(editForm.width_max) : null,
+        length_max: editForm.length_max ? parseInt(editForm.length_max) : null,
+        roof_stye: editForm.roof_stye.trim(),
+        base_price,
+        leg_height_price: 0,
+        enclosed_sides_price: 0,
+        enclosed_ends_price: 0,
+      });
+
+      // Sync region mappings
+      const currentRegions = new Set(editForm.selectedRegionIds);
+      const originalRegions = new Set(originalRegionRef.current[String(editingId)] ?? []);
+      for (const regionId of currentRegions) {
+        if (!originalRegions.has(regionId)) {
+          await insertRegionPriceMatrix(regionId, editingId);
+        }
+      }
+      for (const regionId of originalRegions) {
+        if (!currentRegions.has(regionId)) {
+          await deleteRegionPriceMatrix(regionId, editingId);
+        }
+      }
+
+      toastSuccess("Price updated");
+      setEditingId(null);
+      setEditForm({ roof_stye: "", width: "", length: "", width_max: "", length_max: "", base_price: "", selectedRegionIds: [] });
+      await onRefresh();
+    } catch (err) { toastError(err.message); }
+    finally { setSaving(false); }
+  }, [editForm, editingId, featureId, onRefresh]);
+
+  const handleCancel = useCallback(() => {
+    setEditingId(null);
+    setEditForm({ roof_stye: "", width: "", length: "", width_max: "", length_max: "", base_price: "", selectedRegionIds: [] });
+    setRegionSelections((prev) => {
+      const original = originalRegionRef.current[String(editingId)];
+      if (original) return { ...prev, [editingId]: [...original] };
+      const next = { ...prev };
+      delete next[editingId];
+      return next;
+    });
+  }, [editingId]);
+
+  // ─── DELETE ───────────────────────────────────────────────
+
+  const handleDelete = useCallback(async (row) => {
+    setSaving(true);
+    try {
+      await deleteMatrixPrice(row.matrix_price_id);
+      toastSuccess("Price deleted");
+      await onRefresh();
+    } catch (err) { toastError(err.message); }
+    finally { setSaving(false); }
+  }, [onRefresh]);
+
+  const roofStyleColumns = useMemo(() => [
+    {
+      key: "roof_stye", label: "Roof Style", width: 160, sortable: true,
+      render: (row) => editingId === row.matrix_price_id
+        ? <select className="form-select form-select-sm" value={editForm.roof_stye} onChange={(e) => setEditForm((p) => ({ ...p, roof_stye: e.target.value }))}>
+            <option value="">Select…</option>
+            {roofStyleOptions(editForm.roof_stye).map((opt) => <option key={opt} value={opt}>{opt}</option>)}
+          </select>
+        : (row.roof_stye || "—"),
+    },
+    {
+      key: "width", label: "Width Range", width: 150, sortable: true,
+      sortValue: (row) => `${row.width ?? 0}-${row.width_max ?? 0}`,
+      render: (row) => editingId === row.matrix_price_id
+        ? (
+          <div className="d-flex gap-1 align-items-center">
+            <input type="number" className="form-control form-control-sm" style={{ width: 55 }} placeholder="Min" value={editForm.width} onChange={(e) => setEditForm((p) => ({ ...p, width: e.target.value.replace(/[^0-9]/g, "") }))} />
+            <span>–</span>
+            <input type="number" className="form-control form-control-sm" style={{ width: 55 }} placeholder="Max" value={editForm.width_max} onChange={(e) => setEditForm((p) => ({ ...p, width_max: e.target.value.replace(/[^0-9]/g, "") }))} />
+          </div>
+        )
+        : `${row.width ?? "-"}–${row.width_max ?? "-"}`,
+    },
+    {
+      key: "length", label: "Length", width: 150, sortable: true,
+      sortValue: (row) => `${row.length ?? 0}-${row.length_max ?? 0}`,
+      render: (row) => editingId === row.matrix_price_id
+        ? (
+          <div className="d-flex gap-1 align-items-center">
+            <input type="number" className="form-control form-control-sm" style={{ width: 55 }} placeholder="Min" value={editForm.length} onChange={(e) => setEditForm((p) => ({ ...p, length: e.target.value.replace(/[^0-9]/g, "") }))} />
+            <span>–</span>
+            <input type="number" className="form-control form-control-sm" style={{ width: 55 }} placeholder="Max" value={editForm.length_max} onChange={(e) => setEditForm((p) => ({ ...p, length_max: e.target.value.replace(/[^0-9]/g, "") }))} />
+          </div>
+        )
+        : `${row.length ?? "-"}–${row.length_max ?? "-"}`,
+    },
+    {
+      key: "base_price", label: "Base Price", width: 130, sortable: true,
+      render: (row) => editingId === row.matrix_price_id
+        ? <input className="form-control form-control-sm" value={formatCurrencyInput(editForm.base_price)} onChange={(e) => setEditForm((p) => ({ ...p, base_price: parseCurrencyInput(e.target.value) }))} />
+        : formatCurrency(row.base_price),
+    },
+    {
+      key: "regions", label: "Regions", width: 260, sortable: false,
+      render: (row) => {
+        const rowId = row.matrix_price_id;
+        const isEditing = editingId === rowId;
+        const selected = new Set(isEditing ? (editForm.selectedRegionIds ?? []) : (regionSelections[rowId] ?? originalRegionRef.current[String(rowId)] ?? []));
+        if (isEditing) {
+          return (
+            <div className="d-flex flex-wrap gap-1" style={{ maxWidth: 260 }}>
+              {regions.map((r) => (
+                <label key={r.region_id} className="form-check form-check-inline mb-0 me-1" style={{ fontSize: "0.8rem" }}>
+                  <input
+                    type="checkbox"
+                    className="form-check-input"
+                    checked={selected.has(r.region_id)}
+                    onChange={(e) => {
+                      setEditForm((prev) => ({
+                        ...prev,
+                        selectedRegionIds: e.target.checked
+                          ? [...(prev.selectedRegionIds ?? []), r.region_id]
+                          : (prev.selectedRegionIds ?? []).filter((id) => id !== r.region_id),
+                      }));
+                    }}
+                  />
+                  <span className="form-check-label">{r.state_code}</span>
+                </label>
+              ))}
+            </div>
+          );
+        }
+        if (selected.size === 0) return <span className="text-muted small">All regions</span>;
+        const codes = regions.filter((r) => selected.has(r.region_id)).map((r) => r.state_code);
+        return <span className="small text-truncate d-inline-block" style={{ maxWidth: 250 }} title={codes.join(", ")}>{codes.join(", ")}</span>;
+      },
+    },
+   
+  ], [editingId, editForm, regionSelections, regions]);
+
+  const roofStyleActions = useMemo(() => [
+    { key: "view-roof-style", label: "View", type: "secondary", icon: "eye", onClick: (r) => setViewRow(r) },
+
+    { key: "edit-price", label: "Edit", type: "secondary", icon: "pen", visible: (r) => editingId !== r.matrix_price_id, onClick: (r) => handleStartEdit(r) },
+    { key: "save-price", label: "Save", type: "primary", icon: "floppy-disk", visible: (r) => editingId === r.matrix_price_id, onClick: () => handleSave(), disabled: saving },
+    { key: "cancel-price", label: "Cancel", type: "secondary", icon: "xmark", visible: (r) => editingId === r.matrix_price_id, onClick: () => handleCancel(), disabled: saving },
+    { key: "delete-price", label: "Delete", type: "danger", icon: "trash", visible: (r) => editingId !== r.matrix_price_id, confirm: true, confirmMessage: (r) => `Delete roof style row "${roofStyleRowLabel(r)}"? This cannot be undone.`, onClick: (r) => handleDelete(r), disabled: saving },
+  ], [editingId, saving, handleStartEdit, handleSave, handleCancel, handleDelete]);
+
+  const filterConfig = useMemo(() => createFilterConfig([
+    { key: "roof_stye", label: "Roof Style", type: TABLE_FILTER_TYPES.SELECT, options: ROOF_STYLE_OPTIONS.map((value) => ({ label: value, value })) },
+    { key: "base_price", label: "Base Price", type: TABLE_FILTER_TYPES.TEXT },
+  ]), []);
+
+  return (
+    <div>
+      
+      <TableZ
+        columns={roofStyleColumns}
+        data={prices}
+        rowIdKey="matrix_price_id"
+        actions={roofStyleActions}
+        filterConfig={filterConfig}
+        sort={{ key: "width", direction: "asc" }}
+        defaultFiltersExpanded={false}
+        stickyFilters
+        filterToolbarAction={(
+          <div className="d-flex align-items-center gap-2">
+            <Button size="sm" variant="ghost" onClick={onRefresh} title="Refresh">
+              <FontAwesomeIcon icon={faSync} />
+            </Button>
+            <Button size="sm" onClick={() => setAddOpen(true)}><FontAwesomeIcon icon={faPlus} /> Add Roof Style</Button>
+          </div>
+        )}
+        emptyMessage="No roof style pricing rows yet."
+        hideSearch
+      />
+      <Modal title="Add Roof Style Price" show={addOpen} onHide={() => setAddOpen(false)} size="lg">
+        <div className="row g-2 mb-3">
+          <div className="col-3">
+            <label className="form-label small mb-1">Roof Style *</label>
+            <select className="form-select form-select-sm" value={addForm.roof_stye} onChange={(e) => setAddForm({ ...addForm, roof_stye: e.target.value })}>
+              <option value="">Select…</option>
+              {roofStyleOptions(addForm.roof_stye).map((opt) => <option key={opt} value={opt}>{opt}</option>)}
+            </select>
+          </div>
+          <div className="col-3">
+            <label className="form-label small mb-1">Base Price ($) *</label>
+            <input className="form-control form-control-sm" value={addForm.base_price} onChange={(e) => setAddForm({ ...addForm, base_price: formatCurrencyInput(e.target.value) })} />
+          </div>
+          
+        </div>
+        <div className="row g-2 mb-3">
+          <div className="col">
+            <label className="form-label small mb-1">Min Width</label>
+            <input type="number" className="form-control form-control-sm" value={addForm.width} onChange={(e) => setAddForm({ ...addForm, width: e.target.value.replace(/[^0-9]/g, "") })} />
+          </div>
+          <div className="col">
+            <label className="form-label small mb-1">Max Width</label>
+            <input type="number" className="form-control form-control-sm" value={addForm.width_max} onChange={(e) => setAddForm({ ...addForm, width_max: e.target.value.replace(/[^0-9]/g, "") })} />
+          </div>
+          <div className="col">
+            <label className="form-label small mb-1">Min Length</label>
+            <input type="number" className="form-control form-control-sm" value={addForm.length} onChange={(e) => setAddForm({ ...addForm, length: e.target.value.replace(/[^0-9]/g, "") })} />
+          </div>          
+          <div className="col">
+            <label className="form-label small mb-1">Max Length</label>
+            <input type="number" className="form-control form-control-sm" value={addForm.length_max} onChange={(e) => setAddForm({ ...addForm, length_max: e.target.value.replace(/[^0-9]/g, "") })} />
+          </div>
+        </div>
+         <br/><br/>
+        <div className="row g-2 mb-3">
+        
+          <div className="col-12">
+            <label className="form-label small mb-1">Regions (optional — none = all regions)</label>
+            <div className="d-flex flex-wrap gap-1">
+              {regions.map((r) => (
+                <label key={r.region_id} className="form-check form-check-inline mb-0 me-1" style={{ fontSize: "0.8rem" }}>
+                  <input
+                    type="checkbox"
+                    className="form-check-input"
+                    checked={addForm.selectedRegionIds.includes(r.region_id)}
+                    onChange={(e) => {
+                      setAddForm((prev) => ({
+                        ...prev,
+                        selectedRegionIds: e.target.checked
+                          ? [...prev.selectedRegionIds, r.region_id]
+                          : prev.selectedRegionIds.filter((id) => id !== r.region_id),
+                      }));
+                    }}
+                  />
+                  <span className="form-check-label">{r.name} ({r.state_code})</span>
+                </label>
+              ))}
+            </div>
+          </div>
+        </div>
+        <div className="d-flex justify-content-end">
+          <Button size="sm" onClick={handleAdd} loading={saving}>Add Price </Button>
+        </div>
+      </Modal>
+      <RowViewModal
+        show={Boolean(viewRow)}
+        onHide={() => setViewRow(null)}
+        title="Roof Style Price"
+        fields={viewRow ? [
+          { label: "Roof Style", value: viewRow.roof_stye ?? "—" },
+          { label: "Width", value: `${viewRow.width ?? "—"} – ${viewRow.width_max ?? "—"}` },
+          { label: "Length", value: `${viewRow.length ?? "—"} – ${viewRow.length_max ?? "—"}` },
+          { label: "Base Price", value: formatCurrency(viewRow.base_price) },
+          { label: "Regions", value: formatRegionNames(regions, regionSelections[viewRow.matrix_price_id] ?? originalRegionRef.current[String(viewRow.matrix_price_id)] ?? []), full: true },
+        ] : []}
+      />
+
+    </div>
+  );
+}
+// ─── MATRIX EDITOR ─────────────────────────────────────────
+
+function legLengthRangeLabel(row) {
+  const min = row?.min_length;
+  const max = row?.max_length;
+  const hasMin = min !== null && min !== undefined && min !== "";
+  const hasMax = max !== null && max !== undefined && max !== "";
+  if (!hasMin && !hasMax) return "—";
+  if (!hasMax) return `≥ ${min} ft`;
+  if (!hasMin) return `≤ ${max} ft`;
+  return `${min} – ${max} ft`;
+}
+
+function legHeightRowLabel(row, legTypes) {
+  const range = legLengthRangeLabel(row);
+  const legType = legTypes.find((lt) => lt.leg_type_id === row?.leg_type_id)?.name ?? (row?.leg_type_id ?? "—");
+  const h = row?.leg_height != null ? `${row.leg_height}'` : "—";
+  return `${range} / ${legType} / ${h}`;
+}
+
+// LEG HEIGHT MATRIX EDITOR
+function LegHeightMatrixEditor(props) {
+  // Keep the table mounted so its filter/sort/pagination state survives
+  // data refreshes (e.g. after adding a row).
+  return <LegHeightMatrixTable {...props} />;
+}
+
+function LegHeightMatrixTable({ prices, legTypes, regions, featureId, onRefresh }) {
+  const [editingId, setEditingId] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [addOpen, setAddOpen] = useState(false);
+  const [viewRow, setViewRow] = useState(null);
+
+  const [addForm, setAddForm] = useState({ min_length: "", max_length: "", leg_type_id: "", leg_height: "", price: "", selectedRegionIds: [] });
+  const [editForm, setEditForm] = useState({ min_length: "", max_length: "", leg_type_id: "", leg_height: "", price: "", selectedRegionIds: [] });
+
+  // Region mappings (metal_m_region_legprice_matrix) keyed by leg_matrix_id
+  const [regionSelections, setRegionSelections] = useState({});
+  const originalRegionRef = useRef({});
+
+  useEffect(() => {
+    let cancelled = false;
+    const realIds = prices
+      .filter((p) => typeof p.leg_matrix_id === "number" && p.leg_matrix_id > 0)
+      .map((p) => p.leg_matrix_id);
+    if (realIds.length === 0) return;
+    (async () => {
+      try {
+        const map = await bulkLoadRegionLegPriceMatrix(realIds);
+        if (cancelled) return;
+        originalRegionRef.current = { ...map };
+        setRegionSelections((prev) => {
+          const next = { ...prev };
+          for (const id of realIds) {
+            next[id] = [...(map[id] ?? [])];
+          }
+          return next;
+        });
+      } catch (err) { /* silently fail */ }
+    })();
+    return () => { cancelled = true; };
+  }, [prices]);
+  // ADD
+
+  const handleAdd = useCallback(async () => {
+    const price = parseFloat(parseCurrencyInput(addForm.price));
+    if (isNaN(price) || price <= 0) { toastError("Price is required"); return; }
+    if (!addForm.leg_type_id) { toastError("Leg Type is required"); return; }
+    const minLength = addForm.min_length ? parseInt(addForm.min_length) : null;
+    const maxLength = addForm.max_length ? parseInt(addForm.max_length) : null;
+    if (minLength != null && maxLength != null && minLength > maxLength) { toastError("Max Length must be greater than or equal to Min Length"); return; }
+
+    setSaving(true);
+    try {
+      const result = await upsertLegHeightPrice({
+        feature_id: featureId,
+        leg_type_id: parseInt(addForm.leg_type_id),
+        leg_height: addForm.leg_height ? parseInt(addForm.leg_height) : null,
+        min_length: minLength,
+        max_length: maxLength,
+        price,
+      });
+
+      const realId = result?.leg_matrix_id;
+      if (realId && addForm.selectedRegionIds.length > 0) {
+        for (const regionId of addForm.selectedRegionIds) {
+          await insertRegionLegPriceMatrix(regionId, realId);
+        }
+      }
+
+      toastSuccess("Price added");
+      setAddForm({ min_length: "", max_length: "", leg_type_id: "", leg_height: "", price: "", selectedRegionIds: [] });
+      setAddOpen(false);
+      await onRefresh();
+    } catch (err) { toastError(err.message); }
+    finally { setSaving(false); }
+  }, [addForm, featureId, onRefresh]);
+
+  // EDIT
+
+  const handleStartEdit = useCallback((row) => {
+    setEditingId(row.leg_matrix_id);
+    const regIds = regionSelections[row.leg_matrix_id] ?? originalRegionRef.current[String(row.leg_matrix_id)] ?? [];
+    setEditForm({
+      min_length: row.min_length ?? "",
+      max_length: row.max_length ?? "",
+      leg_type_id: row.leg_type_id ?? "",
+      leg_height: row.leg_height ?? "",
+      price: row.price ?? "",
+      selectedRegionIds: [...regIds],
+    });
+  }, [regionSelections]);
+
+  const handleSave = useCallback(async () => {
+    const price = parseFloat(parseCurrencyInput(editForm.price));
+    if (isNaN(price) || price <= 0) { toastError("Price is required"); return; }
+    if (!editForm.leg_type_id) { toastError("Leg Type is required"); return; }
+    const minLength = editForm.min_length ? parseInt(editForm.min_length) : null;
+    const maxLength = editForm.max_length ? parseInt(editForm.max_length) : null;
+    if (minLength != null && maxLength != null && minLength > maxLength) { toastError("Max Length must be greater than or equal to Min Length"); return; }
+
+    setSaving(true);
+    try {
+      await upsertLegHeightPrice({
+        leg_matrix_id: editingId,
+        feature_id: featureId,
+        leg_type_id: parseInt(editForm.leg_type_id),
+        leg_height: editForm.leg_height ? parseInt(editForm.leg_height) : null,
+        min_length: minLength,
+        max_length: maxLength,
+        price,
+      });
+
+      // Sync region mappings
+      const currentRegions = new Set(editForm.selectedRegionIds);
+      const originalRegions = new Set(originalRegionRef.current[String(editingId)] ?? []);
+      for (const regionId of currentRegions) {
+        if (!originalRegions.has(regionId)) {
+          await insertRegionLegPriceMatrix(regionId, editingId);
+        }
+      }
+      for (const regionId of originalRegions) {
+        if (!currentRegions.has(regionId)) {
+          await deleteRegionLegPriceMatrix(regionId, editingId);
+        }
+      }
+
+      toastSuccess("Price updated");
+      setEditingId(null);
+      setEditForm({ min_length: "", max_length: "", leg_type_id: "", leg_height: "", price: "", selectedRegionIds: [] });
+      await onRefresh();
+    } catch (err) { toastError(err.message); }
+    finally { setSaving(false); }
+  }, [editForm, editingId, featureId, onRefresh]);
+
+  const handleCancel = useCallback(() => {
+    setEditingId(null);
+    setEditForm({ min_length: "", max_length: "", leg_type_id: "", leg_height: "", price: "", selectedRegionIds: [] });
+    setRegionSelections((prev) => {
+      const original = originalRegionRef.current[String(editingId)];
+      if (original) return { ...prev, [editingId]: [...original] };
+      const next = { ...prev };
+      delete next[editingId];
+      return next;
+    });
+  }, [editingId]);
+
+  // DELETE
+
+  const handleDelete = useCallback(async (row) => {
+    setSaving(true);
+    try {
+      await deleteLegHeightPrice(row.leg_matrix_id);
+      toastSuccess("Price deleted");
+      await onRefresh();
+    } catch (err) { toastError(err.message); }
+    finally { setSaving(false); }
+  }, [onRefresh]);
+  const legHeightColumns = useMemo(() => [
+    {
+      key: "length_range", label: "Length Range", width: 200, sortable: true,
+      sortValue: (row) => `${row.min_length ?? 0}-${row.max_length ?? 0}`,
+      render: (row) => editingId === row.leg_matrix_id
+        ? (
+          <div className="d-flex gap-1 align-items-center">
+            <input type="number" className="form-control form-control-sm" style={{ width: 70 }} placeholder="Min" value={editForm.min_length} onChange={(e) => setEditForm((p) => ({ ...p, min_length: e.target.value.replace(/[^0-9]/g, "") }))} />
+            <span className="text-muted small">–</span>
+            <input type="number" className="form-control form-control-sm" style={{ width: 70 }} placeholder="Max" value={editForm.max_length} onChange={(e) => setEditForm((p) => ({ ...p, max_length: e.target.value.replace(/[^0-9]/g, "") }))} />
+          </div>
+        )
+        : legLengthRangeLabel(row),
+    },
+    {
+      key: "leg_type_id", label: "Leg Type", width: 160, sortable: true,
+      sortValue: (row) => legTypes.find((lt) => lt.leg_type_id === row?.leg_type_id)?.name ?? "",
+      render: (row) => editingId === row.leg_matrix_id
+        ? (
+          <select className="form-select form-select-sm" value={editForm.leg_type_id} onChange={(e) => setEditForm((p) => ({ ...p, leg_type_id: e.target.value }))}>
+            <option value="">Select…</option>
+            {legTypes.map((lt) => <option key={lt.leg_type_id} value={lt.leg_type_id}>{lt.name}</option>)}
+          </select>
+        )
+        : (legTypes.find((lt) => lt.leg_type_id === row?.leg_type_id)?.name ?? row?.leg_type_id ?? "—"),
+    },
+    {
+      key: "leg_height", label: "Wall Height", width: 110, sortable: true,
+      sortValue: (row) => row.leg_height ?? 0,
+      render: (row) => editingId === row.leg_matrix_id
+        ? (
+          <div className="d-flex gap-1 align-items-center">
+            <input type="number" className="form-control form-control-sm" style={{ width: 60 }} placeholder="ft" value={editForm.leg_height} onChange={(e) => setEditForm((p) => ({ ...p, leg_height: e.target.value.replace(/[^0-9]/g, "") }))} />
+            <span>&apos;</span>
+          </div>
+        )
+        : (row.leg_height != null ? `${row.leg_height}'` : "—"),
+    },
+    {
+      key: "price", label: "Price", width: 130, sortable: true,
+      render: (row) => editingId === row.leg_matrix_id
+        ? <input className="form-control form-control-sm" value={formatCurrencyInput(editForm.price)} onChange={(e) => setEditForm((p) => ({ ...p, price: parseCurrencyInput(e.target.value) }))} />
+        : formatCurrency(row.price),
+    },
+    {
+      key: "regions", label: "Regions", width: 260, sortable: false,
+      render: (row) => {
+        const rowId = row.leg_matrix_id;
+        const isEditing = editingId === rowId;
+        const selected = new Set(isEditing ? (editForm.selectedRegionIds ?? []) : (regionSelections[rowId] ?? originalRegionRef.current[String(rowId)] ?? []));
+        if (isEditing) {
+          return (
+            <div className="d-flex flex-wrap gap-1" style={{ maxWidth: 260 }}>
+              {regions.map((r) => (
+                <label key={r.region_id} className="form-check form-check-inline mb-0 me-1" style={{ fontSize: "0.8rem" }}>
+                  <input
+                    type="checkbox"
+                    className="form-check-input"
+                    checked={selected.has(r.region_id)}
+                    onChange={(e) => {
+                      setEditForm((prev) => ({
+                        ...prev,
+                        selectedRegionIds: e.target.checked
+                          ? [...(prev.selectedRegionIds ?? []), r.region_id]
+                          : (prev.selectedRegionIds ?? []).filter((id) => id !== r.region_id),
+                      }));
+                    }}
+                  />
+                  <span className="form-check-label">{r.state_code}</span>
+                </label>
+              ))}
+            </div>
+          );
+        }
+        if (selected.size === 0) return <span className="text-muted small">All regions</span>;
+        const codes = regions.filter((r) => selected.has(r.region_id)).map((r) => r.state_code);
+        return <span className="small text-truncate d-inline-block" style={{ maxWidth: 250 }} title={codes.join(", ")}>{codes.join(", ")}</span>;
+      },
+    },
+  ], [editingId, editForm, legTypes, regionSelections, regions]);
+
+  const legHeightActions = useMemo(() => [
+    { key: "view-leg-height", label: "View", type: "secondary", icon: "eye", onClick: (r) => setViewRow(r) },
+
+    { key: "edit-price", label: "Edit", type: "secondary", icon: "pen", visible: (r) => editingId !== r.leg_matrix_id, onClick: (r) => handleStartEdit(r) },
+    { key: "save-price", label: "Save", type: "primary", icon: "floppy-disk", visible: (r) => editingId === r.leg_matrix_id, onClick: () => handleSave(), disabled: saving },
+    { key: "cancel-price", label: "Cancel", type: "secondary", icon: "xmark", visible: (r) => editingId === r.leg_matrix_id, onClick: () => handleCancel(), disabled: saving },
+    { key: "delete-price", label: "Delete", type: "danger", icon: "trash", visible: (r) => editingId !== r.leg_matrix_id, confirm: true, confirmMessage: (r) => `Delete leg height row "${legHeightRowLabel(r, legTypes)}"? This cannot be undone.`, onClick: (r) => handleDelete(r), disabled: saving },
+  ], [editingId, saving, handleStartEdit, handleSave, handleCancel, handleDelete, legTypes]);
+
+  const legHeightFilterConfig = useMemo(() => createFilterConfig([
+    { key: "min_length", label: "Min Length", type: TABLE_FILTER_TYPES.TEXT },
+    { key: "max_length", label: "Max Length", type: TABLE_FILTER_TYPES.TEXT },
+    { key: "leg_type_id", label: "Leg Type", type: TABLE_FILTER_TYPES.SELECT, options: legTypes.map((lt) => ({ label: lt.name, value: String(lt.leg_type_id) })) },
+    { key: "leg_height", label: "Leg Height", type: TABLE_FILTER_TYPES.TEXT },
+    { key: "price", label: "Price", type: TABLE_FILTER_TYPES.TEXT },
+  ]), [legTypes]);
+return (
+    <div>
+
+      <div className="mb-3 psb-hide-search">
+        <TableZ
+          variant="setup"
+          columns={legHeightColumns}
+          data={prices}
+          rowIdKey="leg_matrix_id"
+          actions={legHeightActions}
+          filterConfig={legHeightFilterConfig}
+          sort={{ key: "length_range", direction: "asc" }}
+          defaultFiltersExpanded={false}
+          stickyFilters
+          filterToolbarAction={(
+            <div className="d-flex align-items-center gap-2">
+              <Button size="sm" variant="ghost" onClick={onRefresh} title="Refresh">
+                <FontAwesomeIcon icon={faSync} />
+              </Button>
+              <Button size="sm" onClick={() => setAddOpen(true)}><FontAwesomeIcon icon={faPlus} /> Add Leg Height Price</Button>
+            </div>
+          )}
+          emptyMessage="No leg height pricing rows yet."
+        />
+      </div>
+      <Modal title="Add Leg Height Price" show={addOpen} onHide={() => setAddOpen(false)} size="lg">
+        <div className="row g-2 mb-3">
+          <div className="col-4">
+            <label className="form-label small mb-1">Length Range (ft)</label>
+            <div className="d-flex gap-1 align-items-center">
+              <input type="number" className="form-control form-control-sm" placeholder="Min" value={addForm.min_length} onChange={(e) => setAddForm({ ...addForm, min_length: e.target.value.replace(/[^0-9]/g, "") })} />
+              <span className="text-muted small">–</span>
+              <input type="number" className="form-control form-control-sm" placeholder="Max" value={addForm.max_length} onChange={(e) => setAddForm({ ...addForm, max_length: e.target.value.replace(/[^0-9]/g, "") })} />
+            </div>
+          </div>
+          <div className="col-4">
+            <label className="form-label small mb-1">Leg Type *</label>
+            <select className="form-select form-select-sm" value={addForm.leg_type_id} onChange={(e) => setAddForm({ ...addForm, leg_type_id: e.target.value })}>
+              <option value="">Select…</option>
+              {legTypes.map((lt) => <option key={lt.leg_type_id} value={lt.leg_type_id}>{lt.name}</option>)}
+            </select>
+          </div>
+          <div className="col-2">
+            <label className="form-label small mb-1">Wall Height (ft)</label>
+            <input type="number" className="form-control form-control-sm" value={addForm.leg_height} onChange={(e) => setAddForm({ ...addForm, leg_height: e.target.value.replace(/[^0-9]/g, "") })} />
+          </div>
+          <div className="col-2">
+            <label className="form-label small mb-1">Price ($) *</label>
+            <input className="form-control form-control-sm" value={addForm.price} onChange={(e) => setAddForm({ ...addForm, price: formatCurrencyInput(e.target.value) })} />
+          </div>
+        </div>
+        <br/>
+        <div className="row g-2 mb-3">
+          <div className="col-12">
+            <label className="form-label small mb-1">Regions </label>
+            <div className="d-flex flex-wrap gap-1">
+              {regions.map((r) => (
+                <label key={r.region_id} className="form-check form-check-inline mb-0 me-1" style={{ fontSize: "0.8rem" }}>
+                  <input
+                    type="checkbox"
+                    className="form-check-input"
+                    checked={addForm.selectedRegionIds.includes(r.region_id)}
+                    onChange={(e) => {
+                      setAddForm((prev) => ({
+                        ...prev,
+                        selectedRegionIds: e.target.checked
+                          ? [...prev.selectedRegionIds, r.region_id]
+                          : prev.selectedRegionIds.filter((id) => id !== r.region_id),
+                      }));
+                    }}
+                  />
+                  <span className="form-check-label">{r.state_code}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+        </div>
+        <div className="d-flex justify-content-end">
+          <Button size="sm" onClick={handleAdd} loading={saving}>Add</Button>
+        </div>
+      </Modal>
+      <RowViewModal
+        show={Boolean(viewRow)}
+        onHide={() => setViewRow(null)}
+        title="Leg Height Price"
+        fields={viewRow ? [
+          { label: "Length Range", value: legLengthRangeLabel(viewRow) },
+          { label: "Leg Type", value: legTypes.find((lt) => lt.leg_type_id === viewRow.leg_type_id)?.name ?? viewRow.leg_type_id ?? "—" },
+          { label: "Leg Height", value: viewRow.leg_height != null ? `${viewRow.leg_height}'` : "—" },
+          { label: "Price", value: formatCurrency(viewRow.price) },
+          { label: "Regions", value: formatRegionNames(regions, regionSelections[viewRow.leg_matrix_id] ?? originalRegionRef.current[String(viewRow.leg_matrix_id)] ?? []), full: true },
+        ] : []}
+      />
+
+    </div>
+  );
+}
+function MatrixEditor(props) {
+  // Keep the table mounted so its filter/sort/pagination state survives
+  // data refreshes (e.g. after adding a row). Form state resets are handled
+  // explicitly inside MatrixTable after each save/cancel.
+  return <MatrixTable {...props} />;
+}
+
+function MatrixTable({ featureId, prices, styles, regions, framings, onRefresh, isLeanFeature = false }) {
+  const [editingId, setEditingId] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [addOpen, setAddOpen] = useState(false);
+  const [viewRow, setViewRow] = useState(null);
+
+  const [addForm, setAddForm] = useState({ style_id: styles.find((s) => s.render_key === "rib_type")?.style_id ?? styles[0]?.style_id ?? "", roof_stye: "", width: "", length: "", height: "", framing: "", base_price: "", leg_height_price: "", enclosed_sides_price: "", enclosed_ends_price: "", selectedRegionIds: [] });
+  const [editForm, setEditForm] = useState({ style_id: "", roof_stye: "", width: "", length: "", height: "", framing: "", base_price: "", leg_height_price: "", enclosed_sides_price: "", enclosed_ends_price: "", selectedRegionIds: [] });
+
+  // ─── Region mappings ──────────────────────────────────────
+  // { [matrix_price_id]: region_id[] } — tracks assigned regions per row
+  const [regionSelections, setRegionSelections] = useState({});
+  const originalRegionRef = useRef({});
+
+  // Load existing region mappings on mount / when prices change
+  useEffect(() => {
+    let cancelled = false;
+    const realIds = prices
+      .filter((p) => typeof p.matrix_price_id === "number" && p.matrix_price_id > 0)
+      .map((p) => p.matrix_price_id);
+    if (realIds.length === 0) return;
+    (async () => {
+      try {
+        const map = await bulkLoadRegionPriceMatrix(realIds);
+        if (cancelled) return;
+        originalRegionRef.current = { ...map };
+        setRegionSelections((prev) => {
+          const next = { ...prev };
+          for (const id of realIds) {
+            // Always overwrite with the freshly loaded DB state (in-progress edits live in editForm).
+            next[id] = [...(map[id] ?? [])];
+          }
+          return next;
+        });
+      } catch (err) { /* silently fail */ }
+    })();
+    return () => { cancelled = true; };
+  }, [prices]);
+
+  // ─── ADD ───────────────────────────────────────────────────
+
+  const handleAdd = useCallback(async () => {
+    const base_price = parseFloat(parseCurrencyInput(addForm.base_price));
+    if (isNaN(base_price) || base_price <= 0) { toastError("Base Price is required"); return; }
+    // Lean rows are keyed by Roof Style (roof_stye); other rows by Style.
+    if (isLeanFeature ? !addForm.roof_stye.trim() : !addForm.style_id) { toastError(isLeanFeature ? "Roof Style is required" : "Style is required"); return; }
+
+    setSaving(true);
+    try {
+      const result = await upsertMatrixPrice({
+        feature_id: featureId,
+        ...(isLeanFeature
+          ? { style_id: null, roof_stye: addForm.roof_stye.trim() }
+          : { style_id: parseInt(addForm.style_id) }),
+        width: addForm.width ? parseInt(addForm.width) : null,
+        length: addForm.length ? parseInt(addForm.length) : null,
+        height: addForm.height ? parseInt(addForm.height) : null,
+        framing: addForm.framing ? parseInt(addForm.framing) : null,
+        base_price,
+        leg_height_price: parseFloat(parseCurrencyInput(addForm.leg_height_price)) || 0,
+        enclosed_sides_price: parseFloat(parseCurrencyInput(addForm.enclosed_sides_price)) || 0,
+        enclosed_ends_price: parseFloat(parseCurrencyInput(addForm.enclosed_ends_price)) || 0,
+      });
+
+      const realId = result?.matrix_price_id;
+      if (realId && addForm.selectedRegionIds.length > 0) {
+        for (const regionId of addForm.selectedRegionIds) {
+          await insertRegionPriceMatrix(regionId, realId);
+        }
+      }
+
+      toastSuccess("Price added");
+      setAddForm({ style_id: styles.find((s) => s.render_key === "rib_type")?.style_id ?? styles[0]?.style_id ?? "", roof_stye: "", width: "", length: "", height: "", framing: "", base_price: "", leg_height_price: "", enclosed_sides_price: "", enclosed_ends_price: "", selectedRegionIds: [] });
+      setAddOpen(false);
+      await onRefresh();
+    } catch (err) { toastError(err.message); }
+    finally { setSaving(false); }
+  }, [addForm, featureId, isLeanFeature, styles, onRefresh]);
+
+  // ─── EDIT ───────────────────────────────────────────────────
+
+  const handleStartEdit = useCallback((row) => {
+    setEditingId(row.matrix_price_id);
+    const regIds = regionSelections[row.matrix_price_id] ?? originalRegionRef.current[String(row.matrix_price_id)] ?? [];
+    setEditForm({
+      style_id: row.style_id ?? "",
+      roof_stye: row.roof_stye ?? "",
+      width: row.width ?? "",
+      length: row.length ?? "",
+      height: row.height ?? "",
+      framing: row.framing != null ? String(row.framing) : "",
+      base_price: row.base_price ?? "",
+      leg_height_price: row.leg_height_price ?? "",
+      enclosed_sides_price: row.enclosed_sides_price ?? "",
+      enclosed_ends_price: row.enclosed_ends_price ?? "",
+      selectedRegionIds: [...regIds],
+    });
+  }, [regionSelections]);
+
+  const handleSave = useCallback(async () => {
+    const base_price = parseFloat(parseCurrencyInput(editForm.base_price));
+    if (isNaN(base_price) || base_price <= 0) { toastError("Base Price is required"); return; }
+    // Lean rows are keyed by Roof Style (roof_stye); other rows by Style.
+    if (isLeanFeature ? !editForm.roof_stye.trim() : !editForm.style_id) { toastError(isLeanFeature ? "Roof Style is required" : "Style is required"); return; }
+
+    setSaving(true);
+    try {
+      await upsertMatrixPrice({
+        matrix_price_id: editingId,
+        feature_id: featureId,
+        ...(isLeanFeature
+          ? { style_id: null, roof_stye: editForm.roof_stye.trim() }
+          : { style_id: parseInt(editForm.style_id) }),
+        width: editForm.width ? parseInt(editForm.width) : null,
+        length: editForm.length ? parseInt(editForm.length) : null,
+        height: editForm.height ? parseInt(editForm.height) : null,
+        framing: editForm.framing ? parseInt(editForm.framing) : null,
+        base_price,
+        leg_height_price: parseFloat(parseCurrencyInput(editForm.leg_height_price)) || 0,
+        enclosed_sides_price: parseFloat(parseCurrencyInput(editForm.enclosed_sides_price)) || 0,
+        enclosed_ends_price: parseFloat(parseCurrencyInput(editForm.enclosed_ends_price)) || 0,
+      });
+
+      // Sync region mappings
+      const currentRegions = new Set(editForm.selectedRegionIds);
+      const originalRegions = new Set(originalRegionRef.current[String(editingId)] ?? []);
+      for (const regionId of currentRegions) {
+        if (!originalRegions.has(regionId)) {
+          await insertRegionPriceMatrix(regionId, editingId);
+        }
+      }
+      for (const regionId of originalRegions) {
+        if (!currentRegions.has(regionId)) {
+          await deleteRegionPriceMatrix(regionId, editingId);
+        }
+      }
+
+      toastSuccess("Price updated");
+      setEditingId(null);
+      setEditForm({ style_id: "", roof_stye: "", width: "", length: "", height: "", framing: "", base_price: "", leg_height_price: "", enclosed_sides_price: "", enclosed_ends_price: "", selectedRegionIds: [] });
+      await onRefresh();
+    } catch (err) { toastError(err.message); }
+    finally { setSaving(false); }
+  }, [editForm, editingId, featureId, isLeanFeature, onRefresh]);
+
+  const handleCancel = useCallback(() => {
+    setEditingId(null);
+    setEditForm({ style_id: "", roof_stye: "", width: "", length: "", height: "", framing: "", base_price: "", leg_height_price: "", enclosed_sides_price: "", enclosed_ends_price: "", selectedRegionIds: [] });
+    setRegionSelections((prev) => {
+      const original = originalRegionRef.current[String(editingId)];
+      if (original) return { ...prev, [editingId]: [...original] };
+      const next = { ...prev };
+      delete next[editingId];
+      return next;
+    });
+  }, [editingId]);
+
+  // ─── DELETE ───────────────────────────────────────────────
+
+  const handleDelete = useCallback(async (row) => {
+    setSaving(true);
+    try {
+      await deleteMatrixPrice(row.matrix_price_id);
+      toastSuccess("Price deleted");
+      await onRefresh();
+    } catch (err) { toastError(err.message); }
+    finally { setSaving(false); }
+  }, [onRefresh]);
+
+  const matrixColumns = useMemo(() => [
+    isLeanFeature ? {
+      key: "roof_stye", label: "Roof Style", width: 160, sortable: true,
+      render: (row) => editingId === row.matrix_price_id
+        ? <select className="form-select form-select-sm" value={editForm.roof_stye} onChange={(e) => setEditForm((p) => ({ ...p, roof_stye: e.target.value }))}>
+            <option value="">—</option>
+            {roofStyleOptions(editForm.roof_stye).map((opt) => <option key={opt} value={opt}>{opt}</option>)}
+          </select>
+        : (row.roof_stye || "—"),
+    } : {
+      key: "style_name", label: "Style", width: 160, sortable: true,
+      render: (row) => editingId === row.matrix_price_id
+        ? <select className="form-select form-select-sm" value={editForm.style_id} onChange={(e) => setEditForm((p) => ({ ...p, style_id: e.target.value }))}>
+            <option value="">—</option>
+            {styles.map((s) => <option key={s.style_id} value={s.style_id}>{s.name}</option>)}
+          </select>
+        : row.style_name,
+    },
+    ...(!isLeanFeature ? [{
+      key: "framing_name", label: "Framing", width: 150, sortable: true,
+      render: (row) => editingId === row.matrix_price_id
+        ? <select className="form-select form-select-sm" value={editForm.framing ?? ""} onChange={(e) => setEditForm((p) => ({ ...p, framing: e.target.value }))}>
+            <option value="">—</option>
+            {(framings ?? []).map((f) => <option key={f.id} value={String(f.id)}>{f.framing_name}</option>)}
+          </select>
+        : (row.framing_name ?? "—"),
+    }] : []),
+    {
+      key: "width", label: "Width", width: 100, sortable: true,
+      render: (row) => editingId === row.matrix_price_id
+        ? <input type="number" className="form-control form-control-sm" value={editForm.width} onChange={(e) => setEditForm((p) => ({ ...p, width: e.target.value.replace(/[^0-9]/g, "") }))} />
+        : (row.width ?? "—"),
+    },
+    {
+      key: "length", label: "Length", width: 100, sortable: true,
+      render: (row) => editingId === row.matrix_price_id
+        ? <input type="number" className="form-control form-control-sm" value={editForm.length} onChange={(e) => setEditForm((p) => ({ ...p, length: e.target.value.replace(/[^0-9]/g, "") }))} />
+        : (row.length ?? "—"),
+    },
+    {
+      key: "base_price", label: isLeanFeature ? "Price" : "Base Price", width: 130, sortable: true,
+      render: (row) => editingId === row.matrix_price_id
+        ? <input className="form-control form-control-sm" value={formatCurrencyInput(editForm.base_price)} onChange={(e) => setEditForm((p) => ({ ...p, base_price: parseCurrencyInput(e.target.value) }))} />
+        : formatCurrency(row.base_price),
+    },
+    {
+      key: "regions", label: "Regions", width: 260, sortable: false,
+      render: (row) => {
+        const rowId = row.matrix_price_id;
+        const isEditing = editingId === rowId;
+        const selected = new Set(isEditing ? (editForm.selectedRegionIds ?? []) : (regionSelections[rowId] ?? []));
+
+        if (isEditing) {
+          return (
+            <div className="d-flex flex-wrap gap-1" style={{ maxWidth: 250 }}>
+              {regions.map((r) => (
+                <label key={r.region_id} className="form-check form-check-inline mb-0 me-1" style={{ fontSize: "0.75rem" }}>
+                  <input
+                    type="checkbox"
+                    className="form-check-input"
+                    style={{ marginTop: "0.15rem" }}
+                    checked={selected.has(r.region_id)}
+                    onChange={(e) => {
+                      setEditForm((p) => ({
+                        ...p,
+                        selectedRegionIds: e.target.checked
+                          ? [...(p.selectedRegionIds ?? []), r.region_id]
+                          : (p.selectedRegionIds ?? []).filter((id) => id !== r.region_id),
+                      }));
+                    }}
+                  />
+                  <span className="form-check-label">{r.state_code}</span>
+                </label>
+              ))}
+            </div>
+          );
+        }
+
+        if (selected.size === 0) return <span className="text-muted small">All regions</span>;
+        return (
+          <div className="d-flex flex-wrap gap-1">
+            {[...selected].map((rid) => {
+              const reg = regions.find((r) => r.region_id === rid);
+              return <Badge key={rid} variant="info" className="small">{reg?.state_code ?? rid}</Badge>;
+            })}
+          </div>
+        );
+      },
+    },
+  ], [isLeanFeature, editingId, editForm, styles, regions, regionSelections, framings]);
+
+  const matrixActions = useMemo(() => [
+    { key: "view-matrix", label: "View", type: "secondary", icon: "eye", onClick: (r) => setViewRow(r) },
+
+    { key: "edit-price", label: "Edit", type: "secondary", icon: "pen", visible: (r) => editingId !== r.matrix_price_id, onClick: (r) => handleStartEdit(r) },
+    { key: "save-price", label: "Save", type: "primary", icon: "floppy-disk", visible: (r) => editingId === r.matrix_price_id, onClick: () => handleSave(), disabled: saving },
+    { key: "cancel-price", label: "Cancel", type: "secondary", icon: "xmark", visible: (r) => editingId === r.matrix_price_id, onClick: () => handleCancel(), disabled: saving },
+    { key: "delete-price", label: "Delete", type: "danger", icon: "trash", visible: (r) => editingId !== r.matrix_price_id, confirm: true, confirmMessage: (r) => `Delete price row (${isLeanFeature ? (r.roof_stye ?? "\u2014") : r.style_name} ${r.width ?? "\u2014"} x ${r.length ?? "\u2014"})?`, onClick: (r) => handleDelete(r), disabled: saving },
+  ], [isLeanFeature, editingId, saving, handleStartEdit, handleSave, handleCancel, handleDelete]);
+
+  const styleFilterOptions = useMemo(() => styles.map((s) => ({ label: s.name, value: s.name })), [styles]);
+
+  const matrixFilterConfig = useMemo(() => createFilterConfig(isLeanFeature ? [
+    { key: "width", label: "Width", type: TABLE_FILTER_TYPES.TEXT },
+    { key: "length", label: "Length", type: TABLE_FILTER_TYPES.TEXT },
+    { key: "roof_stye", label: "Roof Style", type: TABLE_FILTER_TYPES.SELECT, options: ROOF_STYLE_OPTIONS.map((value) => ({ label: value, value })) },
+    { key: "base_price", label: "Price", type: TABLE_FILTER_TYPES.TEXT },
+  ] : [
+    { key: "style_name", label: "Style", type: TABLE_FILTER_TYPES.SELECT, options: styleFilterOptions },
+    { key: "framing", label: "Framing", type: TABLE_FILTER_TYPES.SELECT, options: (framings ?? []).map((f) => ({ label: f.framing_name, value: String(f.id) })) },
+    { key: "width", label: "Width", type: TABLE_FILTER_TYPES.TEXT },
+    { key: "length", label: "Length", type: TABLE_FILTER_TYPES.TEXT },
+    { key: "base_price", label: "Base Price", type: TABLE_FILTER_TYPES.TEXT },
+  ]), [isLeanFeature, styleFilterOptions, framings]);
+
+  return (
+    <div>
+    
+      <div className="mb-3 psb-hide-search">
+        <TableZ
+          columns={matrixColumns}
+          data={prices}
+          rowIdKey="matrix_price_id"
+          actions={matrixActions}
+          emptyMessage="No matrix prices found."
+          filterConfig={matrixFilterConfig}
+          defaultFiltersExpanded={false}
+          stickyFilters
+          filterToolbarAction={(
+            <div className="d-flex align-items-center gap-2">
+              <Button size="sm" variant="ghost" onClick={onRefresh} title="Refresh">
+                <FontAwesomeIcon icon={faSync} />
+              </Button>
+              <Button size="sm" onClick={() => setAddOpen(true)}>
+                <FontAwesomeIcon icon={faPlus} /> {isLeanFeature ? "Add Lean Structure Price" : "Base Structure Price"}
+              </Button>
+            </div>
+          )}
+        />
+      </div>
+      <Modal title={isLeanFeature ? "Add Lean Structure Price" : "Add Base Price"} show={addOpen} onHide={() => setAddOpen(false)} size="lg">
+          <div className="row g-2 mb-2">
+            <div className="col-3">
+              <label className="form-label small mb-1">{isLeanFeature ? "Roof Style *" : "Style *"}</label>
+              {isLeanFeature ? (
+                <select className="form-select form-select-sm" value={addForm.roof_stye} onChange={(e) => setAddForm({ ...addForm, roof_stye: e.target.value })}>
+                  <option value="">—</option>
+                  {roofStyleOptions(addForm.roof_stye).map((opt) => <option key={opt} value={opt}>{opt}</option>)}
+                </select>
+              ) : (
+                <select className="form-select form-select-sm" value={addForm.style_id} onChange={(e) => setAddForm({ ...addForm, style_id: e.target.value })}>
+                  {styles.map((s) => <option key={s.style_id} value={s.style_id}>{s.name}</option>)}
+                </select>
+              )}
+            </div>
+            <div className="col">
+              <label className="form-label small mb-1">Width</label>
+              <input type="number" className="form-control form-control-sm" value={addForm.width} onChange={(e) => setAddForm({ ...addForm, width: e.target.value.replace(/[^0-9]/g, "") })} />
+            </div>
+            <div className="col">
+              <label className="form-label small mb-1">Length</label>
+              <input type="number" className="form-control form-control-sm" value={addForm.length} onChange={(e) => setAddForm({ ...addForm, length: e.target.value.replace(/[^0-9]/g, "") })} />
+            </div>
+            <div className="col-3">
+              <label className="form-label small mb-1">{isLeanFeature ? "Price ($) *" : "Base Price ($) *"}</label>
+              <input className="form-control form-control-sm" value={addForm.base_price} onChange={(e) => setAddForm({ ...addForm, base_price: formatCurrencyInput(e.target.value) })} />
+            </div>
+          </div>
+          {!isLeanFeature && (
+            <div className="row g-2 mb-2">
+              <div className="col-3">
+                <label className="form-label small mb-1">Framing</label>
+                <select className="form-select form-select-sm" value={addForm.framing ?? ""} onChange={(e) => setAddForm({ ...addForm, framing: e.target.value })}>
+                  <option value="">—</option>
+                  {(framings ?? []).map((f) => <option key={f.id} value={String(f.id)}>{f.framing_name}</option>)}
+                </select>
+              </div>
+            </div>
+          )}
+          <br/>
+          <div className="row g-2 mb-3">
+            <div className="col-12">
+              <label className="form-label small mb-1">Regions</label>
+              <div className="d-flex flex-wrap gap-1">
+                {regions.map((r) => (
+                  <label key={r.region_id} className="form-check form-check-inline mb-0 me-1" style={{ fontSize: "0.8rem" }}>
+                    <input
+                      type="checkbox"
+                      className="form-check-input"
+                      checked={addForm.selectedRegionIds.includes(r.region_id)}
+                      onChange={(e) => {
+                        setAddForm((prev) => ({
+                          ...prev,
+                          selectedRegionIds: e.target.checked
+                            ? [...prev.selectedRegionIds, r.region_id]
+                            : prev.selectedRegionIds.filter((id) => id !== r.region_id),
+                        }));
+                      }}
+                    />
+                    <span className="form-check-label">{r.state_code}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+          </div>
+          <div className="d-flex justify-content-end">
+            <Button size="sm" onClick={handleAdd} loading={saving}>Add</Button>
+          </div>
+      </Modal>
+      <RowViewModal
+        show={Boolean(viewRow)}
+        onHide={() => setViewRow(null)}
+        title={isLeanFeature ? "Lean Structure Price" : "Base Structure Price"}
+        fields={viewRow ? (isLeanFeature ? [
+          { label: "Width", value: viewRow.width ?? "—" },
+          { label: "Length", value: viewRow.length ?? "—" },
+          { label: "Roof Style", value: viewRow.roof_stye ?? "—" },
+          { label: "Price", value: formatCurrency(viewRow.base_price) },
+          { label: "Regions", value: formatRegionNames(regions, regionSelections[viewRow.matrix_price_id] ?? originalRegionRef.current[String(viewRow.matrix_price_id)] ?? []), full: true },
+        ] : [
+          { label: "Style", value: viewRow.style_name ?? "—" },
+          { label: "Framing", value: viewRow.framing_name ?? "—" },
+          { label: "Width", value: viewRow.width ?? "—" },
+          { label: "Length", value: viewRow.length ?? "—" },
+          { label: "Base Price", value: formatCurrency(viewRow.base_price) },
+          { label: "Regions", value: formatRegionNames(regions, regionSelections[viewRow.matrix_price_id] ?? originalRegionRef.current[String(viewRow.matrix_price_id)] ?? []), full: true },
+        ]) : []}
+      />
+
+    </div>
+  );
+}
+
+// ─── RATE EDITOR ───────────────────────────────────────────
+
+const RATE_UNITS = [
+  { value: "sqft", label: "sq ft" },
+  { value: "linear_ft", label: "linear ft" },
+  { value: "each", label: "each" },
+];
+
+function rateUnitLabel(unit) {
+  const found = RATE_UNITS.find((u) => u.value === unit);
+  if (found) return found.label;
+  if (unit === "linearft") return "linear ft";
+  return unit ?? "—";
+}
+
+function RateEditor({ featureId, rates, onRefresh }) {
+  const [editingId, setEditingId] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [addOpen, setAddOpen] = useState(false);
+  const [viewRow, setViewRow] = useState(null);
+
+  const [addForm, setAddForm] = useState({ rate: "", unit: "sqft" });
+  const [editForm, setEditForm] = useState({ rate: "", unit: "sqft" });
+
+  // ADD
+  const handleAdd = useCallback(async () => {
+    const parsed = parseFloat(parseCurrencyInput(addForm.rate));
+    if (isNaN(parsed) || parsed <= 0) { toastError("Rate is required"); return; }
+    if (!addForm.unit) { toastError("Unit is required"); return; }
+
+    setSaving(true);
+    try {
+      await upsertRate({ rate_id: null, feature_id: featureId, rate: parsed, unit: addForm.unit });
+      toastSuccess("Rate added");
+      setAddForm({ rate: "", unit: "sqft" });
+      setAddOpen(false);
+      await onRefresh();
+    } catch (err) { toastError(err.message); }
+    finally { setSaving(false); }
+  }, [addForm, featureId, onRefresh]);
+
+  // EDIT
+  const handleStartEdit = useCallback((row) => {
+    setEditingId(row.rate_id);
+    setEditForm({ rate: row.rate ?? "", unit: row.unit ?? "sqft" });
+  }, []);
+
+  const handleSave = useCallback(async () => {
+    const parsed = parseFloat(parseCurrencyInput(editForm.rate));
+    if (isNaN(parsed) || parsed <= 0) { toastError("Rate is required"); return; }
+    if (!editForm.unit) { toastError("Unit is required"); return; }
+
+    setSaving(true);
+    try {
+      await upsertRate({ rate_id: editingId, feature_id: featureId, rate: parsed, unit: editForm.unit });
+      toastSuccess("Rate updated");
+      setEditingId(null);
+      setEditForm({ rate: "", unit: "sqft" });
+      await onRefresh();
+    } catch (err) { toastError(err.message); }
+    finally { setSaving(false); }
+  }, [editForm, editingId, featureId, onRefresh]);
+
+  const handleCancel = useCallback(() => {
+    setEditingId(null);
+    setEditForm({ rate: "", unit: "sqft" });
+  }, []);
+
+  // DELETE
+  const handleDelete = useCallback(async (row) => {
+    setSaving(true);
+    try {
+      await deleteRate(row.rate_id);
+      toastSuccess("Rate deleted");
+      await onRefresh();
+    } catch (err) { toastError(err.message); }
+    finally { setSaving(false); }
+  }, [onRefresh]);
+
+  const rateColumns = useMemo(() => [
+    {
+      key: "rate", label: "Rate", width: 140, sortable: true,
+      sortValue: (row) => Number(row.rate ?? 0),
+      render: (row) => editingId === row.rate_id
+        ? <input className="form-control form-control-sm text-end" value={editForm.rate} onChange={(e) => setEditForm((p) => ({ ...p, rate: formatCurrencyInput(e.target.value) }))} />
+        : <span>{formatCurrency(row.rate)}</span>,
+    },
+    {
+      key: "unit", label: "Unit of Measure (UoM)", width: 140, sortable: true,
+      sortValue: (row) => rateUnitLabel(row.unit),
+      render: (row) => editingId === row.rate_id
+        ? (
+          <select className="form-select form-select-sm" value={editForm.unit} onChange={(e) => setEditForm((p) => ({ ...p, unit: e.target.value }))}>
+            {RATE_UNITS.map((u) => <option key={u.value} value={u.value}>{u.label}</option>)}
+          </select>
+        )
+        : <span>{rateUnitLabel(row.unit)}</span>,
+    },
+  ], [editingId, editForm]);
+
+  const rateActions = useMemo(() => [
+    { key: "view-rate", label: "View", type: "secondary", icon: "eye", onClick: (r) => setViewRow(r) },
+    { key: "edit-rate", label: "Edit", type: "secondary", icon: "pen", visible: (r) => editingId !== r.rate_id, onClick: (r) => handleStartEdit(r) },
+    { key: "save-rate", label: "Save", type: "primary", icon: "floppy-disk", visible: (r) => editingId === r.rate_id, onClick: () => handleSave(), disabled: saving },
+    { key: "cancel-rate", label: "Cancel", type: "secondary", icon: "xmark", visible: (r) => editingId === r.rate_id, onClick: () => handleCancel(), disabled: saving },
+    { key: "delete-rate", label: "Delete", type: "danger", icon: "trash", visible: (r) => editingId !== r.rate_id, confirm: true, confirmMessage: (r) => `Delete rate ${formatCurrency(r.rate)}? This cannot be undone.`, onClick: (r) => handleDelete(r), disabled: saving },
+  ], [editingId, saving, handleStartEdit, handleSave, handleCancel, handleDelete]);
+
+  const rateFilterConfig = useMemo(() => createFilterConfig([
+    { key: "rate", label: "Rate", type: TABLE_FILTER_TYPES.TEXT },
+    { key: "unit", label: "Unit", type: TABLE_FILTER_TYPES.SELECT, options: RATE_UNITS.map((u) => ({ label: u.label, value: u.value })) },
+  ]), []);
+
+  return (
+    <div>
+      <div className="mb-3 psb-hide-search">
+        <TableZ
+          columns={rateColumns}
+          data={rates}
+          rowIdKey="rate_id"
+          actions={rateActions}
+          emptyMessage="No rate found."
+          filterConfig={rateFilterConfig}
+          defaultFiltersExpanded={false}
+          stickyFilters
+          filterToolbarAction={(
+            <div className="d-flex align-items-center gap-2">
+              <Button size="sm" variant="ghost" onClick={onRefresh} title="Refresh">
+                <FontAwesomeIcon icon={faSync} />
+              </Button>
+              <Button size="sm" onClick={() => setAddOpen(true)}><FontAwesomeIcon icon={faPlus} /> Add Rate</Button>
+            </div>
+          )}
+        />
+      </div>
+      <Modal title="Add New Rate" show={addOpen} onHide={() => setAddOpen(false)}>
+        <div className="row g-2 mb-3">
+          <div className="col-6">
+            <label className="form-label small mb-1">Rate ($) *</label>
+            <input className="form-control form-control-sm" value={addForm.rate} onChange={(e) => setAddForm({ ...addForm, rate: formatCurrencyInput(e.target.value) })} />
+          </div>
+          <div className="col-6">
+            <label className="form-label small mb-1">Unit *</label>
+            <select className="form-select form-select-sm" value={addForm.unit} onChange={(e) => setAddForm({ ...addForm, unit: e.target.value })}>
+              {RATE_UNITS.map((u) => <option key={u.value} value={u.value}>{u.label}</option>)}
+            </select>
+          </div>
+        </div>
+        <div className="d-flex justify-content-end">
+          <Button size="sm" onClick={handleAdd} loading={saving}>Add</Button>
+        </div>
+      </Modal>
+      <RowViewModal
+        show={Boolean(viewRow)}
+        onHide={() => setViewRow(null)}
+        title="Rate"
+        fields={viewRow ? [
+          { label: "Rate", value: formatCurrency(viewRow.rate) },
+          { label: "Unit", value: rateUnitLabel(viewRow.unit) },
+        ] : []}
+      />
+    </div>
+  );
+}
+
+// ─── SNOW LOAD UPCHARGE EDITOR ─────────────────────────────
+// Rendered by FeatureDetail for the "Snow Load" feature. Rows come from
+// FeatureDetail (loadSnowLoadRates); onRefresh reloads them.
+
+const EMPTY_SNOW_FORM = { min_width: "", max_width: "", upcharge_rate: "", snow_load: "", sort: "" };
+
+function snowRangeLabel(row) {
+  const min = row.min_width ?? 0;
+  if (row.max_width === null || row.max_width === undefined) return `${min}' and over`;
+  return `${min}' – ${row.max_width}'`;
+}
+
+function snowFormFromRow(row) {
+  return {
+    min_width: row.min_width ?? "",
+    max_width: row.max_width ?? "",
+    upcharge_rate: row.upcharge_rate ?? "",
+    snow_load: row.snow_load ?? "",
+    sort: row.sort ?? "",
+  };
+}
+
+function SnowLoadEditor({ rows, onRefresh }) {
+  const [saving, setSaving] = useState(false);
+  const [editingId, setEditingId] = useState(null);
+  const [addOpen, setAddOpen] = useState(false);
+  const [viewRow, setViewRow] = useState(null);
+  const [addForm, setAddForm] = useState(EMPTY_SNOW_FORM);
+  const [editForm, setEditForm] = useState(EMPTY_SNOW_FORM);
+
+  const handleAdd = useCallback(async () => {
+    setSaving(true);
+    try {
+      await createSnowLoadRate(addForm);
+      toastSuccess("Snow load rate added");
+      setAddForm(EMPTY_SNOW_FORM);
+      setAddOpen(false);
+      await onRefresh();
+    } catch (err) { toastError(err.message); }
+    finally { setSaving(false); }
+  }, [addForm, onRefresh]);
+
+  const handleStartEdit = useCallback((row) => {
+    setEditingId(row.id);
+    setEditForm(snowFormFromRow(row));
+  }, []);
+
+  const handleSave = useCallback(async () => {
+    setSaving(true);
+    try {
+      await updateSnowLoadRate(editingId, editForm);
+      toastSuccess("Snow load rate updated");
+      setEditingId(null);
+      setEditForm(EMPTY_SNOW_FORM);
+      await onRefresh();
+    } catch (err) { toastError(err.message); }
+    finally { setSaving(false); }
+  }, [editForm, editingId, onRefresh]);
+
+  const handleCancel = useCallback(() => {
+    setEditingId(null);
+    setEditForm(EMPTY_SNOW_FORM);
+  }, []);
+
+  const handleDelete = useCallback(async (row) => {
+    setSaving(true);
+    try {
+      await deleteSnowLoadRate(row.id);
+      toastSuccess("Snow load rate deleted");
+      await onRefresh();
+    } catch (err) { toastError(err.message); }
+    finally { setSaving(false); }
+  }, [onRefresh]);
+
+  const numInput = (value, onChange, extra = {}) => (
+    <input type="number" className="form-control form-control-sm text-end" value={value} onChange={(e) => onChange(e.target.value)} {...extra} />
+  );
+
+  const columns = useMemo(() => [
+    {
+      key: "min_width", label: "Min Width (ft)", width: 130, sortable: true,
+      sortValue: (row) => Number(row.min_width ?? 0),
+      render: (row) => editingId === row.id
+        ? numInput(editForm.min_width, (v) => setEditForm((p) => ({ ...p, min_width: v })), { min: 0, step: 1 })
+        : <span>{row.min_width ?? "—"}</span>,
+    },
+    {
+      key: "max_width", label: "Max Width (ft)", width: 130, sortable: true,
+      sortValue: (row) => Number(row.max_width ?? Number.MAX_SAFE_INTEGER),
+      render: (row) => editingId === row.id
+        ? numInput(editForm.max_width, (v) => setEditForm((p) => ({ ...p, max_width: v })), { min: 0, step: 1, placeholder: "No limit" })
+        : <span>{row.max_width ?? "No limit"}</span>,
+    },
+    {
+      key: "upcharge_rate", label: "Upcharge Rate", width: 140, sortable: true,
+      sortValue: (row) => Number(row.upcharge_rate ?? 0),
+      render: (row) => editingId === row.id
+        ? numInput(editForm.upcharge_rate, (v) => setEditForm((p) => ({ ...p, upcharge_rate: v })), { min: 0, step: "any" })
+        : <span>{row.upcharge_rate ?? "—"}</span>,
+    },
+    {
+      key: "snow_load", label: "Snow Load (psf)", width: 120, sortable: true,
+      sortValue: (row) => Number(row.snow_load ?? 0),
+      render: (row) => editingId === row.id
+        ? numInput(editForm.snow_load, (v) => setEditForm((p) => ({ ...p, snow_load: v })), { min: 0, step: "any" })
+        : <span>{row.snow_load ?? "—"}</span>,
+    },
+    {
+      key: "sort", label: "Sort", width: 90, sortable: true,
+      sortValue: (row) => Number(row.sort ?? 0),
+      render: (row) => editingId === row.id
+        ? numInput(editForm.sort, (v) => setEditForm((p) => ({ ...p, sort: v })), { step: 1 })
+        : <span>{row.sort ?? "—"}</span>,
+    },
+  ], [editingId, editForm]);
+
+  const actions = useMemo(() => [
+    { key: "view-snow", label: "View", type: "secondary", icon: "eye", onClick: (r) => setViewRow(r) },
+    { key: "edit-snow", label: "Edit", type: "secondary", icon: "pen", visible: (r) => editingId !== r.id, onClick: (r) => handleStartEdit(r) },
+    { key: "save-snow", label: "Save", type: "primary", icon: "floppy-disk", visible: (r) => editingId === r.id, onClick: () => handleSave(), disabled: saving },
+    { key: "cancel-snow", label: "Cancel", type: "secondary", icon: "xmark", visible: (r) => editingId === r.id, onClick: () => handleCancel(), disabled: saving },
+    { key: "delete-snow", label: "Delete", type: "danger", icon: "trash", visible: (r) => editingId !== r.id, confirm: true, confirmMessage: (r) => `Delete the snow load rate for ${snowRangeLabel(r)}? This cannot be undone.`, onClick: (r) => handleDelete(r), disabled: saving },
+  ], [editingId, saving, handleStartEdit, handleSave, handleCancel, handleDelete]);
+
+  const filterConfig = useMemo(() => createFilterConfig([
+    { key: "min_width", label: "Min Width", type: TABLE_FILTER_TYPES.TEXT },
+    { key: "max_width", label: "Max Width", type: TABLE_FILTER_TYPES.TEXT },
+    { key: "upcharge_rate", label: "Upcharge Rate", type: TABLE_FILTER_TYPES.TEXT },
+    { key: "snow_load", label: "Snow Load", type: TABLE_FILTER_TYPES.TEXT },
+  ]), []);
+
+  return (
+    <div>
+      <div className="mb-3 psb-hide-search">
+        <TableZ
+          columns={columns}
+          data={rows}
+          rowIdKey="id"
+          actions={actions}
+          emptyMessage="No snow load rates found."
+          filterConfig={filterConfig}
+          defaultFiltersExpanded={false}
+          stickyFilters
+          filterToolbarAction={(
+            <div className="d-flex align-items-center gap-2">
+              <Button size="sm" variant="ghost" onClick={onRefresh} title="Refresh">
+                <FontAwesomeIcon icon={faSync} />
+              </Button>
+              <Button size="sm" onClick={() => setAddOpen(true)}><FontAwesomeIcon icon={faPlus} /> Add Rate</Button>
+            </div>
+          )}
+        />
+      </div>
+
+      <Modal title="Add Snow Load Rate" show={addOpen} onHide={() => setAddOpen(false)}>
+        <div className="row g-2 mb-3">
+          <div className="col-6">
+            <label className="form-label small mb-1">Min Width (ft) *</label>
+            {numInput(addForm.min_width, (v) => setAddForm((p) => ({ ...p, min_width: v })), { min: 0, step: 1 })}
+          </div>
+          <div className="col-6">
+            <label className="form-label small mb-1">Max Width (ft)</label>
+            {numInput(addForm.max_width, (v) => setAddForm((p) => ({ ...p, max_width: v })), { min: 0, step: 1, placeholder: "No limit" })}
+          </div>
+          <div className="col-6">
+            <label className="form-label small mb-1">Upcharge Rate *</label>
+            {numInput(addForm.upcharge_rate, (v) => setAddForm((p) => ({ ...p, upcharge_rate: v })), { min: 0, step: "any" })}
+          </div>
+          <div className="col-6">
+            <label className="form-label small mb-1">Snow Load (psf)</label>
+            {numInput(addForm.snow_load, (v) => setAddForm((p) => ({ ...p, snow_load: v })), { min: 0, step: "any", placeholder: "Optional" })}
+          </div>
+          <div className="col-6">
+            <label className="form-label small mb-1">Sort</label>
+            {numInput(addForm.sort, (v) => setAddForm((p) => ({ ...p, sort: v })), { step: 1, placeholder: "Auto" })}
+          </div>
+        </div>
+        <div className="d-flex justify-content-end">
+          <Button size="sm" onClick={handleAdd} loading={saving}>Add</Button>
+        </div>
+      </Modal>
+
+      <RowViewModal
+        show={Boolean(viewRow)}
+        onHide={() => setViewRow(null)}
+        title="Snow Load Rate"
+        fields={viewRow ? [
+          { label: "Width Range", value: snowRangeLabel(viewRow) },
+          { label: "Upcharge Rate", value: viewRow.upcharge_rate },
+          { label: "Snow Load", value: viewRow.snow_load ?? "—" },
+          { label: "Sort", value: viewRow.sort },
+          { label: "Created", value: viewRow.create_at ? new Date(viewRow.create_at).toLocaleString() : "—" },
+        ] : []}
+      />
+    </div>
+  );
+}
+
+// ─── OPTIONS EDITOR ────────────────────────────────────────
+
+const EMPTY_OPTION_FORM = {
+  name: "",
+  price: "",
+  multiplier: "",
+  min_width: "",
+  max_width: "",
+  min_length: "",
+  max_length: "",
+  min_height: "",
+  max_height: "",
+  selectedRegionIds: [],
+};
+
+const OPTION_DIMENSION_COLUMNS = [
+  { key: "min_width", label: "Min Width" },
+  { key: "max_width", label: "Max Width" },
+  { key: "min_length", label: "Min Length" },
+  { key: "max_length", label: "Max Length" },
+  { key: "min_height", label: "Min Height" },
+  { key: "max_height", label: "Max Height" },
+];
+
+const OPTION_DIMENSION_GROUPS = [
+  { key: "width", label: "Width", min: "min_width", max: "max_width" },
+  { key: "length", label: "Length", min: "min_length", max: "max_length" },
+  { key: "height", label: "Height", min: "min_height", max: "max_height" },
+];
+
+function formatRange(min, max) {
+  const hasMin = min !== null && min !== undefined && min !== "";
+  const hasMax = max !== null && max !== undefined && max !== "";
+  if (!hasMin && !hasMax) return "—";
+  if (hasMin && hasMax) return `${min} – ${max}`;
+  return hasMin ? `${min}` : `${max}`;
+}
+
+function parseIntOrNull(value) {
+  if (value === "" || value === null || value === undefined) return null;
+  const n = parseInt(value, 10);
+  return Number.isNaN(n) ? null : n;
+}
+
+function optionDimensionFields(row) {
+  return {
+    min_width: row.min_width ?? "",
+    max_width: row.max_width ?? "",
+    min_length: row.min_length ?? "",
+    max_length: row.max_length ?? "",
+    min_height: row.min_height ?? "",
+    max_height: row.max_height ?? "",
+  };
+}
+
+function optionDimensionPayload(form, keys) {
+  const payload = {};
+  for (const key of keys) payload[key] = parseIntOrNull(form[key]);
+  return payload;
+}
+
+function buildOptionAutoName(form) {
+  const w = (form.min_width ?? "").toString().trim();
+  const h = (form.min_height ?? "").toString().trim();
+  if (w && h) return `${w}x${h}`;
+  return "Custom Frameout";
+}
+
+function OptionsEditor({ featureId, options, onRefresh, isMultiplier = false, allowedDimensions = null, singleValueDimensions = [], hideName = false, regions = [], enableRegions = false, regionPredicate = null, dimensionsBeforePrice = false, featureName = "Option" }) {
+  const pricingKey = isMultiplier ? "multiplier" : "price";
+  const singleDims = useMemo(() => new Set(singleValueDimensions ?? []), [singleValueDimensions]);
+  const dimensionGroups = useMemo(() => {
+    const keys = allowedDimensions ?? (isMultiplier ? ["width"] : ["width", "length", "height"]);
+    return OPTION_DIMENSION_GROUPS.filter((g) => keys.includes(g.key));
+  }, [isMultiplier, allowedDimensions]);
+  const dimensionColumns = useMemo(() => {
+    const keys = allowedDimensions ?? (isMultiplier ? ["width"] : ["width", "length", "height"]);
+    const allowed = new Set();
+    for (const key of keys) {
+      const g = OPTION_DIMENSION_GROUPS.find((x) => x.key === key);
+      if (g) {
+        allowed.add(g.min);
+        if (!singleDims.has(key)) allowed.add(g.max);
+      }
+    }
+    return OPTION_DIMENSION_COLUMNS.filter((c) => allowed.has(c.key));
+  }, [isMultiplier, allowedDimensions, singleDims]);
+  const dimensionKeys = useMemo(() => dimensionColumns.map((c) => c.key), [dimensionColumns]);
+
+  const [editingId, setEditingId] = useState(null);
+  const [editForm, setEditForm] = useState({ ...EMPTY_OPTION_FORM });
+  const [addOpen, setAddOpen] = useState(false);
+  const [viewRow, setViewRow] = useState(null);
+
+  const [addForm, setAddForm] = useState({ ...EMPTY_OPTION_FORM });
+  const [saving, setSaving] = useState(false);
+
+  const [regionSelections, setRegionSelections] = useState({});
+  const originalRegionRef = useRef({});
+
+  const isRegionOption = useCallback((opt) => {
+    if (!enableRegions) return false;
+    if (typeof regionPredicate === "function") return !!regionPredicate(opt);
+    return true;
+  }, [enableRegions, regionPredicate]);
+
+  const addIsRegionOption = enableRegions && (typeof regionPredicate !== "function" ? true : !!regionPredicate({ name: addForm.name }));
+
+  useEffect(() => {
+    if (!enableRegions) return;
+    let cancelled = false;
+    const realIds = options.filter((o) => typeof o.option_id === "number" && o.option_id > 0).map((o) => o.option_id);
+    if (realIds.length === 0) return;
+    (async () => {
+      try {
+        const map = await bulkLoadRegionFeatureOption(realIds);
+        if (cancelled) return;
+        originalRegionRef.current = { ...map };
+        setRegionSelections((prev) => {
+          const next = { ...prev };
+          for (const id of realIds) {
+            next[id] = [...(map[id] ?? [])];
+          }
+          return next;
+        });
+      } catch (err) { /* silently fail */ }
+    })();
+    return () => { cancelled = true; };
+  }, [options, enableRegions]);
+
+  const handleAdd = async () => {
+    const name = hideName ? "" : addForm.name.trim();
+    if (!hideName && !name) { toastError("Option name required"); return; }
+    const value = parseFloat(addForm[pricingKey]);
+    if (isNaN(value)) { toastError(isMultiplier ? "Multiplier required" : "Price required"); return; }
+    setSaving(true);
+    try {
+      const result = await upsertOption({ feature_id: featureId, name, [pricingKey]: value, ...optionDimensionPayload(addForm, dimensionKeys) });
+      if (addIsRegionOption) {
+        const realId = result?.option_id;
+        if (realId && addForm.selectedRegionIds.length > 0) {
+          for (const regionId of addForm.selectedRegionIds) {
+            await insertRegionFeatureOption(regionId, realId);
+          }
+        }
+      }
+      setAddForm({ ...EMPTY_OPTION_FORM });
+      setAddOpen(false);
+      toastSuccess("Option added");
+      await onRefresh();
+    } catch (err) { toastError(err.message); }
+    finally { setSaving(false); }
+  };
+
+  const handleStartEdit = useCallback((row) => {
+    setEditingId(row.option_id);
+    const regIds = regionSelections[row.option_id] ?? originalRegionRef.current[String(row.option_id)] ?? [];
+    setEditForm({ name: row.name ?? "", price: row.price ?? "", multiplier: row.multiplier ?? "", ...optionDimensionFields(row), selectedRegionIds: [...regIds] });
+  }, [regionSelections]);
+
+  const handleCancel = useCallback(() => {
+    setEditingId(null);
+    setEditForm({ ...EMPTY_OPTION_FORM });
+    setRegionSelections((prev) => {
+      const original = originalRegionRef.current[String(editingId)];
+      if (original) return { ...prev, [editingId]: [...original] };
+      const next = { ...prev };
+      delete next[editingId];
+      return next;
+    });
+  }, [editingId]);
+
+  const handleSave = useCallback(async () => {
+    const name = hideName ? undefined : editForm.name.trim();
+    if (!hideName && !name) { toastError("Option name required"); return; }
+    const value = parseFloat(editForm[pricingKey]);
+    if (isNaN(value)) { toastError(isMultiplier ? "Multiplier required" : "Price required"); return; }
+    setSaving(true);
+    try {
+      await upsertOption({ option_id: editingId, feature_id: featureId, name, [pricingKey]: value, ...optionDimensionPayload(editForm, dimensionKeys) });
+      if (enableRegions) {
+        const editingRow = options.find((o) => o.option_id === editingId);
+        if (isRegionOption(editingRow)) {
+          const currentRegions = new Set(editForm.selectedRegionIds);
+          const originalRegions = new Set(originalRegionRef.current[String(editingId)] ?? []);
+          for (const regionId of currentRegions) {
+            if (!originalRegions.has(regionId)) {
+              await insertRegionFeatureOption(regionId, editingId);
+            }
+          }
+          for (const regionId of originalRegions) {
+            if (!currentRegions.has(regionId)) {
+              await deleteRegionFeatureOption(regionId, editingId);
+            }
+          }
+        }
+      }
+      setEditingId(null);
+      setEditForm({ ...EMPTY_OPTION_FORM });
+      toastSuccess("Option updated");
+      await onRefresh();
+    } catch (err) { toastError(err.message); }
+    finally { setSaving(false); }
+  }, [editingId, editForm, featureId, onRefresh, pricingKey, isMultiplier, dimensionKeys, hideName, enableRegions, options, isRegionOption]);
+
+  const handleDelete = useCallback(async (row) => {
+    setSaving(true);
+    try {
+      await deleteOption(row.option_id);
+      toastSuccess("Option removed");
+      await onRefresh();
+    } catch (err) { toastError(err.message); }
+    finally { setSaving(false); }
+  }, [onRefresh]);
+
+  const optionsColumns = useMemo(() => {
+    const nameColumns = hideName ? [] : [
+      {
+        key: "name", label: "Option Name", width: 250, sortable: true,
+        render: (row) => editingId === row.option_id
+          ? <input className="form-control form-control-sm" value={editForm.name} onChange={(e) => setEditForm((p) => ({ ...p, name: e.target.value }))} />
+          : row.name,
+      },
+    ];
+    const priceColumn = {
+      key: pricingKey, label: isMultiplier ? "Multiplier" : "Price", width: 140, sortable: true,
+      render: (row) => editingId === row.option_id
+        ? <input className="form-control form-control-sm" value={editForm[pricingKey] ?? ""} onChange={(e) => setEditForm((p) => ({ ...p, [pricingKey]: e.target.value }))} />
+        : (isMultiplier ? (row.multiplier ?? "—") : formatCurrency(row.price)),
+    };
+    const dimensionCols = dimensionGroups.map((g) => {
+      const single = singleDims.has(g.key);
+      return {
+        key: g.key, label: g.label, width: 130, sortable: true,
+        sortValue: (row) => `${row[g.min] ?? ""}-${row[g.max] ?? ""}`,
+        render: (row) => editingId === row.option_id
+          ? (single
+            ? <input type="number" className="form-control form-control-sm" placeholder={g.label} style={{ width: 90 }}
+                value={editForm[g.min] ?? ""} onChange={(e) => setEditForm((p) => ({ ...p, [g.min]: e.target.value }))} />
+            : (
+              <div className="d-flex align-items-center gap-1">
+                <input type="number" className="form-control form-control-sm" placeholder="Min" style={{ width: 58 }}
+                  value={editForm[g.min] ?? ""} onChange={(e) => setEditForm((p) => ({ ...p, [g.min]: e.target.value }))} />
+                <span>–</span>
+                <input type="number" className="form-control form-control-sm" placeholder="Max" style={{ width: 58 }}
+                  value={editForm[g.max] ?? ""} onChange={(e) => setEditForm((p) => ({ ...p, [g.max]: e.target.value }))} />
+              </div>
+            )
+          )
+          : (single ? (row[g.min] ?? "—") : formatRange(row[g.min], row[g.max])),
+      };
+    });
+    const regionColumns = enableRegions ? [
+      {
+        key: "regions", label: "Regions", width: 250,
+        render: (row) => {
+          if (!isRegionOption(row)) return <span className="text-muted small">—</span>;
+          const rowId = row.option_id;
+          const isEditing = editingId === rowId;
+          const selected = new Set(isEditing ? (editForm.selectedRegionIds ?? []) : (regionSelections[rowId] ?? originalRegionRef.current[String(rowId)] ?? []));
+          if (isEditing) {
+            return (
+              <div className="d-flex flex-wrap gap-1">
+                {regions.map((r) => (
+                  <label key={r.region_id} className="form-check form-check-inline mb-0 me-1" style={{ fontSize: "0.8rem" }}>
+                    <input
+                      type="checkbox"
+                      className="form-check-input"
+                      checked={selected.has(r.region_id)}
+                      onChange={(e) => {
+                        setEditForm((prev) => ({
+                          ...prev,
+                          selectedRegionIds: e.target.checked
+                            ? [...(prev.selectedRegionIds ?? []), r.region_id]
+                            : (prev.selectedRegionIds ?? []).filter((id) => id !== r.region_id),
+                        }));
+                      }}
+                    />
+                    <span className="form-check-label">{r.state_code}</span>
+                  </label>
+                ))}
+              </div>
+            );
+          }
+          if (selected.size === 0) return <span className="text-muted small">All regions</span>;
+          const codes = regions.filter((r) => selected.has(r.region_id)).map((r) => r.state_code);
+          return <span className="small" title={codes.join(", ")}>{codes.join(", ")}</span>;
+        },
+      },
+    ] : [];
+
+    return [
+      ...nameColumns,
+      // Custom Frameout: Width/Height before Price (dimension-first layout).
+      ...(dimensionsBeforePrice ? dimensionCols : []),
+      priceColumn,
+      ...(dimensionsBeforePrice ? [] : dimensionCols),
+      ...regionColumns,
+    ];
+  }, [editingId, editForm, pricingKey, isMultiplier, dimensionGroups, singleDims, hideName, regionSelections, regions, enableRegions, dimensionsBeforePrice, isRegionOption]);
+
+  const optionsActions = useMemo(() => [
+    { key: "view-option", label: "View", type: "secondary", icon: "eye", onClick: (r) => setViewRow(r) },
+
+    { key: "edit-option", label: "Edit", type: "secondary", icon: "pen", visible: (r) => editingId !== r.option_id, onClick: (r) => handleStartEdit(r) },
+    { key: "save-option", label: "Save", type: "primary", icon: "floppy-disk", visible: (r) => editingId === r.option_id, onClick: () => handleSave(), disabled: saving },
+    { key: "cancel-option", label: "Cancel", type: "secondary", icon: "xmark", visible: (r) => editingId === r.option_id, onClick: () => handleCancel(), disabled: saving },
+    { key: "delete-option", label: "Delete", type: "danger", icon: "trash", visible: (r) => editingId !== r.option_id, confirm: true, confirmMessage: (r) => `Delete option "${r.name}"?`, onClick: (r) => handleDelete(r), disabled: saving },
+  ], [editingId, saving, handleStartEdit, handleSave, handleCancel, handleDelete]);
+
+  const optionsFilterConfig = useMemo(() => createFilterConfig([
+    ...(hideName ? [] : [{ key: "name", label: "Option Name", type: TABLE_FILTER_TYPES.TEXT }]),
+    { key: pricingKey, label: isMultiplier ? "Multiplier" : "Price", type: TABLE_FILTER_TYPES.TEXT },
+    ...dimensionColumns.map((d) => ({ key: d.key, label: d.label, type: TABLE_FILTER_TYPES.TEXT })),
+  ]), [pricingKey, isMultiplier, dimensionColumns, hideName]);
+
+  return (
+    <div>
+     <div className="mb-3 psb-hide-search">
+        <TableZ
+          columns={optionsColumns}
+          data={options}
+          rowIdKey="option_id"
+          actions={optionsActions}
+          emptyMessage="No options found."
+          filterConfig={optionsFilterConfig}
+          defaultFiltersExpanded={false}
+          stickyFilters
+          filterToolbarAction={(
+            <div className="d-flex align-items-center gap-2">
+              <Button size="sm" variant="ghost" onClick={onRefresh} title="Refresh">
+                <FontAwesomeIcon icon={faSync} />
+              </Button>
+              <Button size="sm" onClick={() => setAddOpen(true)}>
+                <FontAwesomeIcon icon={faPlus} /> Add {featureName}
+              </Button>
+            </div>
+          )}
+        />
+      </div>
+      <Modal title={`Add ${featureName}`} show={addOpen} onHide={() => setAddOpen(false)} footer={<Button size="sm" onClick={handleAdd} loading={saving}>Add</Button>}>
+        <div className="d-flex gap-2 align-items-end flex-wrap">
+          {!hideName && (
+            <div style={{ flex: 2, minWidth: 180 }}>
+              <label className="form-label small mb-1">Option Name *</label>
+              <input className="form-control form-control-sm" value={addForm.name} onChange={(e) => setAddForm({ ...addForm, name: e.target.value })} />
+            </div>
+          )}
+          <div style={{ flex: 1, minWidth: 100 }}>
+            <label className="form-label small mb-1">{isMultiplier ? "Multiplier" : "Price ($)"} *</label>
+            <input className="form-control form-control-sm" value={addForm[pricingKey]} onChange={(e) => setAddForm({ ...addForm, [pricingKey]: e.target.value })} />
+          </div>
+        </div>
+        <div className="row g-2 mt-2">
+          {dimensionGroups.map((g) => (
+            <div key={g.key} className="col-6">
+              <label className="form-label small mb-1">{g.label}</label>
+              {singleDims.has(g.key) ? (
+                <input type="number" className="form-control form-control-sm" placeholder={g.label} value={addForm[g.min] ?? ""} onChange={(e) => setAddForm({ ...addForm, [g.min]: e.target.value })} />
+              ) : (
+                <div className="d-flex align-items-center gap-1">
+                  <input type="number" className="form-control form-control-sm" placeholder="Min" value={addForm[g.min] ?? ""} onChange={(e) => setAddForm({ ...addForm, [g.min]: e.target.value })} />
+                  <span>–</span>
+                  <input type="number" className="form-control form-control-sm" placeholder="Max" value={addForm[g.max] ?? ""} onChange={(e) => setAddForm({ ...addForm, [g.max]: e.target.value })} />
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+        {addIsRegionOption && (
+          <div className="mt-3">
+            <label className="form-label small mb-1">Regions</label>
+            <div className="d-flex flex-wrap gap-1">
+              {regions.map((r) => (
+                <label key={r.region_id} className="form-check form-check-inline mb-0 me-1" style={{ fontSize: "0.8rem" }}>
+                  <input
+                    type="checkbox"
+                    className="form-check-input"
+                    checked={addForm.selectedRegionIds.includes(r.region_id)}
+                    onChange={(e) => {
+                      setAddForm((prev) => ({
+                        ...prev,
+                        selectedRegionIds: e.target.checked
+                          ? [...prev.selectedRegionIds, r.region_id]
+                          : prev.selectedRegionIds.filter((id) => id !== r.region_id),
+                      }));
+                    }}
+                  />
+                  <span className="form-check-label">{r.state_code}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+        )}
+      </Modal>
+      <RowViewModal
+        show={Boolean(viewRow)}
+        onHide={() => setViewRow(null)}
+        title="Option"
+        fields={viewRow ? [
+          ...(hideName ? [] : [{ label: "Option Name", value: viewRow.name ?? "—" }]),
+          { label: isMultiplier ? "Multiplier" : "Price", value: isMultiplier ? (viewRow.multiplier ?? "—") : formatCurrency(viewRow.price) },
+          ...dimensionColumns.map((d) => ({ label: d.label, value: viewRow[d.key] ?? "—" })),
+          ...(enableRegions && isRegionOption(viewRow) ? [{ label: "Regions", value: formatRegionCodes(regions, regionSelections[viewRow.option_id] ?? originalRegionRef.current[String(viewRow.option_id)] ?? []), full: true }] : []),
+        ] : []}
+      />
+
+    </div>
+  );
+}
+
+// ─── PANEL EDITOR ──────────────────────────────────────────
+
+function panelTypeLabel(pt) {
+  const name = pt?.panel_name ?? "";
+  return pt?.location_type ? `${name} (${pt.location_type})` : name;
+}
+
+function panelPricingRowLabel(row, panelTypes) {
+  const found = panelTypes.find((pt) => pt.panel_type_id === row?.panel_type_id);
+  const type = found ? panelTypeLabel(found) : (row?.panel_type_id ?? "—");
+  const widthRange = (row?.width != null && row?.max_width != null && Number(row.max_width) !== Number(row.width))
+    ? `${row.width}-${row.max_width}`
+    : (row?.width != null ? String(row.width) : "—");
+  const size = (widthRange !== "—" && row?.height != null) ? `${widthRange} x ${row.height}` : widthRange;
+  return `${type} / ${size}`;
+}
+
+function PanelEditor({ featureId, panelPricing, regions, onRefresh }) {
+  const [editingId, setEditingId] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [addOpen, setAddOpen] = useState(false);
+  const [viewRow, setViewRow] = useState(null);
+
+  const [panelTypes, setPanelTypes] = useState([]);
+  const [addForm, setAddForm] = useState({ panel_type_id: "", option_name: "", width: "", max_width: "", height: "", price: "", siding_style: "Horizontal", selectedRegionIds: [] });
+  const [editForm, setEditForm] = useState({ panel_type_id: "", option_name: "", width: "", max_width: "", height: "", price: "", siding_style: "", selectedRegionIds: [] });
+
+  // Default panel type: "Fully Enclosed" sidewall, if present.
+  const defaultPanelTypeId = useMemo(() => panelTypes.find((p) =>
+    String(p.location_type ?? "").toLowerCase() === "side" &&
+    String(p.panel_name ?? "").toLowerCase().includes("fully closed"),
+  )?.panel_type_id ?? "", [panelTypes]);
+
+  // Panel types (dropdown options; mapped from metal_s_panel_type)
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const types = await loadPanelTypes();
+        if (!cancelled) setPanelTypes(types ?? []);
+      } catch (err) { /* silently fail */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // Apply the default panel type once types load (doesn't clobber a manual pick).
+  useEffect(() => {
+    if (defaultPanelTypeId) {
+      setAddForm((prev) => (prev.panel_type_id ? prev : { ...prev, panel_type_id: defaultPanelTypeId }));
+    }
+  }, [defaultPanelTypeId]);
+
+  // Region mappings (metal_m_region_panelprice_matrix) keyed by panel_pricing_id
+  const [regionSelections, setRegionSelections] = useState({});
+  const originalRegionRef = useRef({});
+
+  useEffect(() => {
+    let cancelled = false;
+    const realIds = panelPricing
+      .filter((p) => typeof p.panel_pricing_id === "number" && p.panel_pricing_id > 0)
+      .map((p) => p.panel_pricing_id);
+    if (realIds.length === 0) return;
+    (async () => {
+      try {
+        const map = await bulkLoadRegionPanelPriceMatrix(realIds);
+        if (cancelled) return;
+        originalRegionRef.current = { ...map };
+        setRegionSelections((prev) => {
+          const next = { ...prev };
+          for (const id of realIds) {
+            next[id] = [...(map[id] ?? [])];
+          }
+          return next;
+        });
+      } catch (err) { /* silently fail */ }
+    })();
+    return () => { cancelled = true; };
+  }, [panelPricing]);
+
+  // ADD
+
+  const handleAdd = useCallback(async () => {
+    const price = parseFloat(parseCurrencyInput(addForm.price));
+    if (isNaN(price) || price <= 0) { toastError("Price is required"); return; }
+    if (!addForm.panel_type_id) { toastError("Panel Type is required"); return; }
+    if (addForm.width && addForm.max_width && Number(addForm.max_width) < Number(addForm.width)) { toastError("Max Width must be greater than or equal to Width"); return; }
+
+    setSaving(true);
+    try {
+      const result = await upsertPanelPricing({
+        feature_id: featureId,
+        panel_type_id: parseInt(addForm.panel_type_id),
+        width: addForm.width ? parseInt(addForm.width) : null,
+        max_width: addForm.max_width ? parseInt(addForm.max_width) : null,
+        height: addForm.height ? parseInt(addForm.height) : null,
+        price,
+        siding_style: addForm.siding_style || null,
+        option_name: addForm.option_name || null,
+      });
+
+      const realId = result?.panel_pricing_id;
+      if (realId && addForm.selectedRegionIds.length > 0) {
+        for (const regionId of addForm.selectedRegionIds) {
+          await insertRegionPanelPriceMatrix(regionId, realId);
+        }
+      }
+
+      toastSuccess("Panel price added");
+      setAddForm({ panel_type_id: defaultPanelTypeId, option_name: "", width: "", max_width: "", height: "", price: "", siding_style: "Horizontal", selectedRegionIds: [] });
+      setAddOpen(false);
+      await onRefresh();
+    } catch (err) { toastError(err.message); }
+    finally { setSaving(false); }
+  }, [addForm, featureId, onRefresh, defaultPanelTypeId]);
+
+  // EDIT
+
+  const handleStartEdit = useCallback((row) => {
+    setEditingId(row.panel_pricing_id);
+    const regIds = regionSelections[row.panel_pricing_id] ?? originalRegionRef.current[String(row.panel_pricing_id)] ?? [];
+    setEditForm({
+      panel_type_id: row.panel_type_id ?? "",
+      option_name: row.option_name ?? "",
+      width: row.width ?? "",
+      max_width: row.max_width ?? "",
+      height: row.height ?? "",
+      price: row.price ?? "",
+      siding_style: row.siding_style ?? "",
+      selectedRegionIds: [...regIds],
+    });
+  }, [regionSelections]);
+
+  const handleSave = useCallback(async () => {
+    const price = parseFloat(parseCurrencyInput(editForm.price));
+    if (isNaN(price) || price <= 0) { toastError("Price is required"); return; }
+    if (!editForm.panel_type_id) { toastError("Panel Type is required"); return; }
+    if (editForm.width && editForm.max_width && Number(editForm.max_width) < Number(editForm.width)) { toastError("Max Width must be greater than or equal to Width"); return; }
+
+    setSaving(true);
+    try {
+      await upsertPanelPricing({
+        feature_id: featureId,
+        panel_pricing_id: editingId,
+        panel_type_id: parseInt(editForm.panel_type_id),
+        width: editForm.width ? parseInt(editForm.width) : null,
+        max_width: editForm.max_width ? parseInt(editForm.max_width) : null,
+        height: editForm.height ? parseInt(editForm.height) : null,
+        price,
+        siding_style: editForm.siding_style || null,
+        option_name: editForm.option_name || null,
+      });
+
+      // Sync region mappings
+      const currentRegions = new Set(editForm.selectedRegionIds);
+      const originalRegions = new Set(originalRegionRef.current[String(editingId)] ?? []);
+      for (const regionId of currentRegions) {
+        if (!originalRegions.has(regionId)) {
+          await insertRegionPanelPriceMatrix(regionId, editingId);
+        }
+      }
+      for (const regionId of originalRegions) {
+        if (!currentRegions.has(regionId)) {
+          await deleteRegionPanelPriceMatrix(regionId, editingId);
+        }
+      }
+
+      toastSuccess("Panel price updated");
+      setEditingId(null);
+      setEditForm({ panel_type_id: "", option_name: "", width: "", max_width: "", height: "", price: "", siding_style: "", selectedRegionIds: [] });
+      await onRefresh();
+    } catch (err) { toastError(err.message); }
+    finally { setSaving(false); }
+  }, [editForm, editingId, featureId, onRefresh]);
+
+  const handleCancel = useCallback(() => {
+    setEditingId(null);
+    setEditForm({ panel_type_id: "", option_name: "", width: "", max_width: "", height: "", price: "", siding_style: "", selectedRegionIds: [] });
+    setRegionSelections((prev) => {
+      const original = originalRegionRef.current[String(editingId)];
+      if (original) return { ...prev, [editingId]: [...original] };
+      const next = { ...prev };
+      delete next[editingId];
+      return next;
+    });
+  }, [editingId]);
+
+  // DELETE
+
+  const handleDelete = useCallback(async (row) => {
+    setSaving(true);
+    try {
+      await deletePanelPricing(row.panel_pricing_id);
+      toastSuccess("Panel price deleted");
+      await onRefresh();
+    } catch (err) { toastError(err.message); }
+    finally { setSaving(false); }
+  }, [onRefresh]);
+
+  const panelColumns = useMemo(() => [
+    {
+      key: "panel_type_id", label: "Panel Type", width: 180, sortable: true,
+      sortValue: (row) => panelTypeLabel(panelTypes.find((pt) => pt.panel_type_id === row?.panel_type_id)),
+      render: (row) => editingId === row.panel_pricing_id
+        ? (
+          <select className="form-select form-select-sm" value={editForm.panel_type_id} onChange={(e) => setEditForm((p) => ({ ...p, panel_type_id: e.target.value }))}>
+            <option value="">Select…</option>
+            {panelTypes.map((pt) => <option key={pt.panel_type_id} value={pt.panel_type_id}>{panelTypeLabel(pt)}</option>)}
+          </select>
+        )
+        : (panelTypeLabel(panelTypes.find((pt) => pt.panel_type_id === row?.panel_type_id)) || (row?.panel_type_id ?? "—")),
+    },
+    {
+      key: "option_name", label: "Option Name", width: 160, sortable: true,
+      sortValue: (row) => row.option_name ?? "",
+      render: (row) => editingId === row.panel_pricing_id
+        ? <input className="form-control form-control-sm" value={editForm.option_name ?? ""} onChange={(e) => setEditForm((p) => ({ ...p, option_name: e.target.value }))} />
+        : (row.option_name ?? "—"),
+    },
+    {
+      key: "width", label: "Width Range", width: 160, sortable: true,
+      sortValue: (row) => row.width ?? 0,
+      render: (row) => editingId === row.panel_pricing_id
+        ? (
+          <div className="d-flex align-items-center gap-1">
+            <input type="number" className="form-control form-control-sm" placeholder="Min" value={editForm.width} onChange={(e) => setEditForm((p) => ({ ...p, width: e.target.value.replace(/[^0-9]/g, "") }))} />
+            <span className="text-muted">-</span>
+            <input type="number" className="form-control form-control-sm" placeholder="Max" value={editForm.max_width} onChange={(e) => setEditForm((p) => ({ ...p, max_width: e.target.value.replace(/[^0-9]/g, "") }))} />
+          </div>
+        )
+        : formatPanelWidthRange(row),
+    },
+    {
+      key: "height", label: "Wall Height", width: 90, sortable: true,
+      sortValue: (row) => row.height ?? 0,
+      render: (row) => editingId === row.panel_pricing_id
+        ? <input type="number" className="form-control form-control-sm" value={editForm.height} onChange={(e) => setEditForm((p) => ({ ...p, height: e.target.value.replace(/[^0-9]/g, "") }))} />
+        : (row.height != null ? row.height : "—"),
+    },
+    {
+      key: "siding_style", label: "Siding Style", width: 140, sortable: true,
+      render: (row) => editingId === row.panel_pricing_id
+        ? (
+          <select className="form-select form-select-sm" value={editForm.siding_style} onChange={(e) => setEditForm((p) => ({ ...p, siding_style: e.target.value }))}>
+            <option value="">Select…</option>
+            {SIDING_STYLE_OPTIONS.map((s) => <option key={s} value={s}>{s}</option>)}
+          </select>
+        )
+        : (row.siding_style ?? "—"),
+    },
+    {
+      key: "price", label: "Price", width: 130, sortable: true,
+      render: (row) => editingId === row.panel_pricing_id
+        ? <input className="form-control form-control-sm" value={formatCurrencyInput(editForm.price)} onChange={(e) => setEditForm((p) => ({ ...p, price: parseCurrencyInput(e.target.value) }))} />
+        : formatCurrency(row.price),
+    },
+    {
+      key: "regions", label: "Regions", width: 260, sortable: false,
+      render: (row) => {
+        const rowId = row.panel_pricing_id;
+        const isEditing = editingId === rowId;
+        const selected = new Set(isEditing ? (editForm.selectedRegionIds ?? []) : (regionSelections[rowId] ?? originalRegionRef.current[String(rowId)] ?? []));
+        if (isEditing) {
+          return (
+            <div className="d-flex flex-wrap gap-1" style={{ maxWidth: 260 }}>
+              {regions.map((r) => (
+                <label key={r.region_id} className="form-check form-check-inline mb-0 me-1" style={{ fontSize: "0.8rem" }}>
+                  <input
+                    type="checkbox"
+                    className="form-check-input"
+                    checked={selected.has(r.region_id)}
+                    onChange={(e) => {
+                      setEditForm((prev) => ({
+                        ...prev,
+                        selectedRegionIds: e.target.checked
+                          ? [...(prev.selectedRegionIds ?? []), r.region_id]
+                          : (prev.selectedRegionIds ?? []).filter((id) => id !== r.region_id),
+                      }));
+                    }}
+                  />
+                  <span className="form-check-label">{r.state_code}</span>
+                </label>
+              ))}
+            </div>
+          );
+        }
+        if (selected.size === 0) return <span className="text-muted small">All regions</span>;
+        const codes = formatRegionCodes(regions, [...selected]);
+        return <span className="small text-truncate d-inline-block" style={{ maxWidth: 250 }} title={codes}>{codes}</span>;
+      },
+    },
+  ], [editingId, editForm, panelTypes, regionSelections, regions]);
+
+  const panelActions = useMemo(() => [
+    { key: "view-panel", label: "View", type: "secondary", icon: "eye", onClick: (r) => setViewRow(r) },
+
+    { key: "edit-price", label: "Edit", type: "secondary", icon: "pen", visible: (r) => editingId !== r.panel_pricing_id, onClick: (r) => handleStartEdit(r) },
+    { key: "save-price", label: "Save", type: "primary", icon: "floppy-disk", visible: (r) => editingId === r.panel_pricing_id, onClick: () => handleSave(), disabled: saving },
+    { key: "cancel-price", label: "Cancel", type: "secondary", icon: "xmark", visible: (r) => editingId === r.panel_pricing_id, onClick: () => handleCancel(), disabled: saving },
+    { key: "delete-price", label: "Delete", type: "danger", icon: "trash", visible: (r) => editingId !== r.panel_pricing_id, confirm: true, confirmMessage: (r) => `Delete panel price row "${panelPricingRowLabel(r, panelTypes)}"? This cannot be undone.`, onClick: (r) => handleDelete(r), disabled: saving },
+  ], [editingId, saving, handleStartEdit, handleSave, handleCancel, handleDelete, panelTypes]);
+
+  const panelPricingForTable = useMemo(() => panelPricing.map((row) => ({
+    ...row,
+    width_range: formatPanelWidthRange(row),
+  })), [panelPricing]);
+
+  const panelFilterConfig = useMemo(() => createFilterConfig([
+    { key: "panel_type_id", label: "Panel Type", type: TABLE_FILTER_TYPES.SELECT, options: panelTypes.map((pt) => ({ label: panelTypeLabel(pt), value: String(pt.panel_type_id) })) },
+    { key: "option_name", label: "Option Name", type: TABLE_FILTER_TYPES.TEXT },
+    { key: "width_range", label: "Width Range", type: TABLE_FILTER_TYPES.TEXT },
+    { key: "height", label: "Wall Height", type: TABLE_FILTER_TYPES.TEXT },
+    { key: "siding_style", label: "Siding Style", type: TABLE_FILTER_TYPES.SELECT, options: SIDING_STYLE_OPTIONS.map((s) => ({ label: s, value: s })) },
+    { key: "price", label: "Price", type: TABLE_FILTER_TYPES.TEXT },
+  ]), [panelTypes]);
+
+  return (
+    <div>
+      
+      <div className="mb-3 psb-hide-search">
+        <TableZ
+          columns={panelColumns}
+          data={panelPricingForTable}
+          rowIdKey="panel_pricing_id"
+          actions={panelActions}
+          filterConfig={panelFilterConfig}
+          sort={{ key: "panel_type_id", direction: "asc" }}
+          defaultFiltersExpanded={false}
+          stickyFilters
+          filterToolbarAction={(
+            <div className="d-flex align-items-center gap-2">
+              <Button size="sm" variant="ghost" onClick={onRefresh} title="Refresh">
+                <FontAwesomeIcon icon={faSync} />
+              </Button>
+              <Button size="sm" onClick={() => setAddOpen(true)}><FontAwesomeIcon icon={faPlus} /> Add Panel Price</Button>
+            </div>
+          )}
+          emptyMessage="No panel pricing rows yet."
+        />
+      </div>
+      <Modal title="Add Panel Price" show={addOpen} onHide={() => setAddOpen(false)} size="lg">
+        <div className="row g-2 mb-3">
+          <div className="col-4">
+            <label className="form-label small mb-1">Panel Type *</label>
+            <select className="form-select form-select-sm" value={addForm.panel_type_id} onChange={(e) => setAddForm({ ...addForm, panel_type_id: e.target.value })}>
+              <option value="">Select…</option>
+              {panelTypes.map((pt) => <option key={pt.panel_type_id} value={pt.panel_type_id}>{panelTypeLabel(pt)}</option>)}
+            </select>
+          </div>
+          <div className="col-4">
+            <label className="form-label small mb-1">Width Range (ft)</label>
+            <div className="d-flex align-items-center gap-1">
+              <input type="number" className="form-control form-control-sm" placeholder="Min" value={addForm.width} onChange={(e) => setAddForm({ ...addForm, width: e.target.value.replace(/[^0-9]/g, "") })} />
+              <span className="text-muted">-</span>
+              <input type="number" className="form-control form-control-sm" placeholder="Max" value={addForm.max_width} onChange={(e) => setAddForm({ ...addForm, max_width: e.target.value.replace(/[^0-9]/g, "") })} />
+            </div>
+          </div>
+          <div className="col-2">
+            <label className="form-label small mb-1">Wall Height (ft)</label>
+            <input type="number" className="form-control form-control-sm" value={addForm.height} onChange={(e) => setAddForm({ ...addForm, height: e.target.value.replace(/[^0-9]/g, "") })} />
+          </div>
+          <div className="col-2">
+            <label className="form-label small mb-1">Siding Style</label>
+            <select className="form-select form-select-sm" value={addForm.siding_style} onChange={(e) => setAddForm({ ...addForm, siding_style: e.target.value })}>
+              <option value="">Select…</option>
+              {SIDING_STYLE_OPTIONS.map((s) => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+        </div>
+        <div className="row g-2 mb-3">
+          <div className="col-6">
+            <label className="form-label small mb-1">Option Name</label>
+            <input className="form-control form-control-sm" value={addForm.option_name} onChange={(e) => setAddForm({ ...addForm, option_name: e.target.value })} placeholder="e.g. Fully Enclosed" />
+          </div>
+          <div className="col-6">
+            <label className="form-label small mb-1">Price ($) *</label>
+            <input className="form-control form-control-sm" value={addForm.price} onChange={(e) => setAddForm({ ...addForm, price: formatCurrencyInput(e.target.value) })} />
+          </div>
+        </div>
+        <div className="row g-2 mb-3">
+          <div className="col-12">
+            <label className="form-label small mb-1">Regions (optional — none = all regions)</label>
+            <div className="d-flex flex-wrap gap-1">
+              {regions.map((r) => (
+                <label key={r.region_id} className="form-check form-check-inline mb-0 me-1" style={{ fontSize: "0.8rem" }}>
+                  <input
+                    type="checkbox"
+                    className="form-check-input"
+                    checked={addForm.selectedRegionIds.includes(r.region_id)}
+                    onChange={(e) => {
+                      setAddForm((prev) => ({
+                        ...prev,
+                        selectedRegionIds: e.target.checked
+                          ? [...prev.selectedRegionIds, r.region_id]
+                          : prev.selectedRegionIds.filter((id) => id !== r.region_id),
+                      }));
+                    }}
+                  />
+                  <span className="form-check-label">{r.state_code}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+        </div>
+        <div className="d-flex justify-content-end">
+          <Button size="sm" onClick={handleAdd} loading={saving}>Add</Button>
+        </div>
+      </Modal>
+      <RowViewModal
+        show={Boolean(viewRow)}
+        onHide={() => setViewRow(null)}
+        title="Panel Price"
+        fields={viewRow ? [
+          { label: "Panel Type", value: panelTypeLabel(panelTypes.find((pt) => pt.panel_type_id === viewRow.panel_type_id)) || (viewRow.panel_type_id ?? "—") },
+          { label: "Option Name", value: viewRow.option_name ?? "—" },
+          { label: "Width", value: formatPanelWidthRange(viewRow) },
+          { label: "Height", value: viewRow.height != null ? viewRow.height : "—" },
+          { label: "Siding Style", value: viewRow.siding_style ?? "—" },
+          { label: "Price", value: formatCurrency(viewRow.price) },
+          { label: "Regions", value: formatRegionCodes(regions, regionSelections[viewRow.panel_pricing_id] ?? originalRegionRef.current[String(viewRow.panel_pricing_id)] ?? []), full: true },
+        ] : []}
+      />
+
+    </div>
+  );
+}
+
+// ─── DOOR / WINDOW EDITOR ──────────────────────────────────
+
+const DOOR_WINDOW_ITEM_TYPES = [
+  { value: "door", label: "Walk-in Door" },
+  { value: "window", label: "Window" },
+  { value: "frameout", label: "Frameout" },
+  { value: "rollup_door", label: "Rollup Door" },
+  { value: "vent", label: "Vent" },
+];
+
+function doorWindowTypeLabel(type) {
+  const found = DOOR_WINDOW_ITEM_TYPES.find((t) => t.value === type);
+  if (found) return found.label;
+  return type ? String(type).replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()) : "—";
+}
+
+// Type dropdown with a "+" button to add a type that is not in the list.
+// New types are stored as a slug (lowercase, underscores, max 20 chars:
+// item_type is VARCHAR(20)).
+function DoorWindowTypeSelect({ value, options, onChange, onAddType }) {
+  const [adding, setAdding] = useState(false);
+  const [draft, setDraft] = useState("");
+
+  const cancel = () => { setAdding(false); setDraft(""); };
+  const confirm = () => {
+    const slug = draft.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+    if (!slug) { toastError("Type name is required"); return; }
+    if (slug.length > 20) { toastError("Type name must be 20 characters or less"); return; }
+    onAddType(slug);
+    onChange(slug);
+    cancel();
+  };
+
+  if (adding) {
+    return (
+      <div className="input-group input-group-sm">
+        <input
+          className="form-control"
+          autoFocus
+          placeholder="New type"
+          maxLength={20}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") { e.preventDefault(); confirm(); }
+            if (e.key === "Escape") { e.preventDefault(); cancel(); }
+          }}
+        />
+        <button type="button" className="btn btn-outline-success" title="Add type" onClick={confirm}><FontAwesomeIcon icon={faCheck} /></button>
+        <button type="button" className="btn btn-outline-secondary" title="Cancel" onClick={cancel}><FontAwesomeIcon icon={faBan} /></button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="input-group input-group-sm">
+      <select className="form-select" value={value} onChange={(e) => onChange(e.target.value)}>
+        {options.map((t) => <option key={t.value} value={t.value}>{t.label}</option>)}
+      </select>
+      <button type="button" className="btn btn-outline-primary" title="Add new type" onClick={() => setAdding(true)}><FontAwesomeIcon icon={faPlus} /></button>
+    </div>
+  );
+}
+
+function DoorWindowEditor({ featureId, items, regions, onRefresh, fixedType = null }) {
+  const defaultType = fixedType || "door";
+  const [editingId, setEditingId] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [addOpen, setAddOpen] = useState(false);
+  const [viewRow, setViewRow] = useState(null);
+
+  const [extraTypes, setExtraTypes] = useState([]);
+  const typeOptions = useMemo(() => {
+    const seen = new Set(DOOR_WINDOW_ITEM_TYPES.map((t) => t.value));
+    const extra = [];
+    for (const v of [...items.map((i) => i.item_type), ...extraTypes]) {
+      const k = String(v ?? "").trim();
+      if (k && !seen.has(k)) { seen.add(k); extra.push({ value: k, label: doorWindowTypeLabel(k) }); }
+    }
+    return [...DOOR_WINDOW_ITEM_TYPES, ...extra];
+  }, [items, extraTypes]);
+  const handleAddType = useCallback((slug) => {
+    setExtraTypes((prev) => (prev.includes(slug) ? prev : [...prev, slug]));
+  }, []);
+
+  const [addForm, setAddForm] = useState({ name: "", item_type: defaultType, price: "", description: "", sort_order: "", selectedRegionIds: [] });
+  const [editForm, setEditForm] = useState({ name: "", item_type: defaultType, price: "", description: "", sort_order: "", selectedRegionIds: [] });
+
+  // Region mappings (metal_m_region_door_window) keyed by item_id
+  const [regionSelections, setRegionSelections] = useState({});
+  const originalRegionRef = useRef({});
+
+  useEffect(() => {
+    let cancelled = false;
+    const realIds = items
+      .filter((i) => typeof i.item_id === "number" && i.item_id > 0)
+      .map((i) => i.item_id);
+    if (realIds.length === 0) return;
+    (async () => {
+      try {
+        const map = await bulkLoadRegionDoorWindow(realIds);
+        if (cancelled) return;
+        originalRegionRef.current = { ...map };
+        setRegionSelections((prev) => {
+          const next = { ...prev };
+          for (const id of realIds) {
+            next[id] = [...(map[id] ?? [])];
+          }
+          return next;
+        });
+      } catch (err) { /* silently fail */ }
+    })();
+    return () => { cancelled = true; };
+  }, [items]);
+
+  // ADD
+  const handleAdd = useCallback(async () => {
+    const price = parseFloat(parseCurrencyInput(addForm.price));
+    if (!addForm.name.trim()) { toastError("Item name is required"); return; }
+    if (!addForm.item_type) { toastError("Item type is required"); return; }
+    if (isNaN(price) || price <= 0) { toastError("Price is required"); return; }
+
+    setSaving(true);
+    try {
+      const result = await upsertDoorWindowItem({
+        feature_id: featureId,
+        name: addForm.name.trim(),
+        item_type: fixedType || addForm.item_type,
+        price,
+        description: addForm.description || null,
+        sort_order: addForm.sort_order ? parseInt(addForm.sort_order) : 0,
+      });
+      const realId = result?.item_id;
+      if (realId && addForm.selectedRegionIds.length > 0) {
+        for (const regionId of addForm.selectedRegionIds) {
+          await insertRegionDoorWindow(regionId, realId);
+        }
+      }
+      toastSuccess("Item added");
+      setAddForm({ name: "", item_type: defaultType, price: "", description: "", sort_order: "", selectedRegionIds: [] });
+      setAddOpen(false);
+      await onRefresh();
+    } catch (err) { toastError(err.message); }
+    finally { setSaving(false); }
+  }, [addForm, featureId, onRefresh, defaultType, fixedType]);
+
+  // EDIT
+  const handleStartEdit = useCallback((row) => {
+    setEditingId(row.item_id);
+    const regIds = regionSelections[row.item_id] ?? originalRegionRef.current[String(row.item_id)] ?? [];
+    setEditForm({
+      name: row.name ?? "",
+      description: row.description ?? "",
+      price: row.price ?? "",
+      item_type: fixedType || row.item_type || defaultType,
+      sort_order: row.sort_order ?? "",
+      selectedRegionIds: [...regIds],
+    });
+  }, [regionSelections, defaultType, fixedType]);
+
+  const handleSave = useCallback(async () => {
+    const price = parseFloat(parseCurrencyInput(editForm.price));
+    if (!editForm.name.trim()) { toastError("Item name is required"); return; }
+    if (!editForm.item_type) { toastError("Item type is required"); return; }
+    if (isNaN(price) || price <= 0) { toastError("Price is required"); return; }
+
+    setSaving(true);
+    try {
+      await upsertDoorWindowItem({
+        item_id: editingId,
+        feature_id: featureId,
+        name: editForm.name.trim(),
+        item_type: fixedType || editForm.item_type,
+        price,
+        description: editForm.description || null,
+        sort_order: editForm.sort_order ? parseInt(editForm.sort_order) : 0,
+      });
+
+      // Sync region mappings
+      const currentRegions = new Set(editForm.selectedRegionIds);
+      const originalRegions = new Set(originalRegionRef.current[String(editingId)] ?? []);
+      for (const regionId of currentRegions) {
+        if (!originalRegions.has(regionId)) {
+          await insertRegionDoorWindow(regionId, editingId);
+        }
+      }
+      for (const regionId of originalRegions) {
+        if (!currentRegions.has(regionId)) {
+          await deleteRegionDoorWindow(regionId, editingId);
+        }
+      }
+
+      toastSuccess("Item updated");
+      setEditingId(null);
+      setEditForm({ name: "", item_type: defaultType, price: "", description: "", sort_order: "", selectedRegionIds: [] });
+      await onRefresh();
+    } catch (err) { toastError(err.message); }
+    finally { setSaving(false); }
+  }, [editForm, editingId, featureId, onRefresh, defaultType, fixedType]);
+
+  const handleCancel = useCallback(() => {
+    setEditingId(null);
+    setEditForm({ name: "", item_type: defaultType, price: "", description: "", sort_order: "", selectedRegionIds: [] });
+    setRegionSelections((prev) => {
+      const original = originalRegionRef.current[String(editingId)];
+      if (original) return { ...prev, [editingId]: [...original] };
+      const next = { ...prev };
+      delete next[editingId];
+      return next;
+    });
+  }, [editingId, defaultType]);
+
+  // DELETE
+  const handleDelete = useCallback(async (row) => {
+    setSaving(true);
+    try {
+      await deleteDoorWindowItem(row.item_id);
+      toastSuccess("Item deleted");
+      await onRefresh();
+    } catch (err) { toastError(err.message); }
+    finally { setSaving(false); }
+  }, [onRefresh]);
+
+  const doorWindowColumns = useMemo(() => [
+    {
+      key: "name", label: "Item Name", width: 240, sortable: true,
+      render: (row) => editingId === row.item_id
+        ? <input className="form-control form-control-sm" value={editForm.name} onChange={(e) => setEditForm((p) => ({ ...p, name: e.target.value }))} />
+        : <span className="fw-medium">{row.name}</span>,
+    },
+    {
+        key: "description", label: "Description", width: 240, sortable: true,
+        render: (row) => editingId === row.item_id
+          ? <input className="form-control form-control-sm" value={editForm.description ?? ""} onChange={(e) => setEditForm((p) => ({ ...p, description: e.target.value }))} />
+          : (row.description
+            ? <span className="text-truncate d-inline-block" style={{ maxWidth: 230 }} title={row.description}>{row.description}</span>
+            : <span className="text-muted">—</span>),
+      },
+    
+    ...(fixedType ? [] : [{
+      key: "item_type", label: "Type", width: 200, sortable: true,
+      sortValue: (row) => doorWindowTypeLabel(row.item_type),
+      render: (row) => editingId === row.item_id
+        ? (
+          <DoorWindowTypeSelect
+            value={editForm.item_type}
+            options={typeOptions}
+            onChange={(v) => setEditForm((p) => ({ ...p, item_type: v }))}
+            onAddType={handleAddType}
+          />
+        )
+        : <span>{doorWindowTypeLabel(row.item_type)}</span>,
+    }]),
+    {
+      key: "price", label: "Price", width: 120, sortable: true,
+      sortValue: (row) => Number(row.price ?? 0),
+      render: (row) => editingId === row.item_id
+        ? <input className="form-control form-control-sm text-end" value={editForm.price} onChange={(e) => setEditForm((p) => ({ ...p, price: formatCurrencyInput(e.target.value) }))} />
+        : <span>{formatCurrency(row.price)}</span>,
+    },
+    ...(fixedType === "rollup_door" || fixedType === "door" ? [
+      
+      {
+        key: "sort_order", label: "Sort Order", width: 100, sortable: true,
+        sortValue: (row) => Number(row.sort_order ?? 0),
+        render: (row) => editingId === row.item_id
+          ? <input type="number" className="form-control form-control-sm" value={editForm.sort_order} onChange={(e) => setEditForm((p) => ({ ...p, sort_order: e.target.value.replace(/[^0-9]/g, "") }))} />
+          : (row.sort_order != null ? row.sort_order : "—"),
+      },
+      
+    ] : []),
+
+    {
+      key: "regions", label: "Regions", width: 260, sortable: false,
+      render: (row) => {
+        const rowId = row.item_id;
+        const isEditing = editingId === rowId;
+        const selected = new Set(isEditing ? (editForm.selectedRegionIds ?? []) : (regionSelections[rowId] ?? originalRegionRef.current[String(rowId)] ?? []));
+        if (isEditing) {
+          return (
+            <div className="d-flex flex-wrap gap-1" style={{ maxWidth: 260 }}>
+              {regions.map((r) => (
+                <label key={r.region_id} className="form-check form-check-inline mb-0 me-1" style={{ fontSize: "0.8rem" }}>
+                  <input
+                    type="checkbox"
+                    className="form-check-input"
+                    checked={selected.has(r.region_id)}
+                    onChange={(e) => {
+                      setEditForm((prev) => ({
+                        ...prev,
+                        selectedRegionIds: e.target.checked
+                          ? [...(prev.selectedRegionIds ?? []), r.region_id]
+                          : (prev.selectedRegionIds ?? []).filter((id) => id !== r.region_id),
+                      }));
+                    }}
+                  />
+                  <span className="form-check-label" title={r.name}>{r.state_code}</span>
+                </label>
+              ))}
+            </div>
+          );
+        }
+        if (selected.size === 0) return <span className="text-muted small">All regions</span>;
+        const picked = regions.filter((r) => selected.has(r.region_id));
+        const codes = picked.map((r) => r.state_code);
+        return <span className="small text-truncate d-inline-block" style={{ maxWidth: 250 }} title={picked.map((r) => r.name).join(", ")}>{codes.join(", ")}</span>;
+      },
+    },
+  ], [editingId, editForm, regionSelections, regions, fixedType, typeOptions, handleAddType]);
+
+  const doorWindowActions = useMemo(() => [
+    { key: "view-door-window", label: "View", type: "secondary", icon: "eye", onClick: (r) => setViewRow(r) },
+
+    { key: "edit-item", label: "Edit", type: "secondary", icon: "pen", visible: (r) => editingId !== r.item_id, onClick: (r) => handleStartEdit(r) },
+    { key: "save-item", label: "Save", type: "primary", icon: "floppy-disk", visible: (r) => editingId === r.item_id, onClick: () => handleSave(), disabled: saving },
+    { key: "cancel-item", label: "Cancel", type: "secondary", icon: "xmark", visible: (r) => editingId === r.item_id, onClick: () => handleCancel(), disabled: saving },
+    { key: "delete-item", label: "Delete", type: "danger", icon: "trash", visible: (r) => editingId !== r.item_id, confirm: true, confirmMessage: (r) => `Delete item "${r.name}"? This cannot be undone.`, onClick: (r) => handleDelete(r), disabled: saving },
+  ], [editingId, saving, handleStartEdit, handleSave, handleCancel, handleDelete]);
+
+  const doorWindowFilterConfig = useMemo(() => createFilterConfig([
+    { key: "name", label: "Item Name", type: TABLE_FILTER_TYPES.TEXT },
+    { key: "item_type", label: "Type", type: TABLE_FILTER_TYPES.SELECT, options: typeOptions.map((t) => ({ label: t.label, value: t.value })) },
+    { key: "price", label: "Price", type: TABLE_FILTER_TYPES.TEXT },
+  ]), [typeOptions]);
+
+  return (
+    <div>
+      <div className="mb-3 psb-hide-search">
+        <TableZ
+          columns={doorWindowColumns}
+          data={items}
+          rowIdKey="item_id"
+          actions={doorWindowActions}
+          emptyMessage="No door/window items found."
+          filterConfig={doorWindowFilterConfig}
+          defaultFiltersExpanded={false}
+          stickyFilters
+          filterToolbarAction={(
+            <div className="d-flex align-items-center gap-2">
+              <Button size="sm" variant="ghost" onClick={onRefresh} title="Refresh">
+                <FontAwesomeIcon icon={faSync} />
+              </Button>
+              <Button size="sm" onClick={() => setAddOpen(true)}><FontAwesomeIcon icon={faPlus} /> Add Item</Button>
+            </div>
+          )}
+        />
+      </div>
+      <Modal title={fixedType === "door" ? "Add New Door" : fixedType === "rollup_door" ? "Add New Rollup Door" : "Add New Item"} show={addOpen} onHide={() => setAddOpen(false)} size="lg">
+        <div className="row g-2 mb-3">
+          <div className="col-4">
+            <label className="form-label small mb-1">Item Name *</label>
+            <input className="form-control form-control-sm" value={addForm.name} onChange={(e) => setAddForm({ ...addForm, name: e.target.value })} />
+          </div>
+          {!fixedType && (
+            <div className="col-3">
+              <label className="form-label small mb-1">Type *</label>
+              <DoorWindowTypeSelect
+                value={addForm.item_type}
+                options={typeOptions}
+                onChange={(v) => setAddForm((p) => ({ ...p, item_type: v }))}
+                onAddType={handleAddType}
+              />
+            </div>
+          )}
+          <div className="col-2">
+            <label className="form-label small mb-1">Price ($) *</label>
+            <input className="form-control form-control-sm" value={addForm.price} onChange={(e) => setAddForm({ ...addForm, price: formatCurrencyInput(e.target.value) })} />
+          </div>
+          <div className="col-2">
+            <label className="form-label small mb-1">Sort Order</label>
+            <input type="number" className="form-control form-control-sm" value={addForm.sort_order} onChange={(e) => setAddForm({ ...addForm, sort_order: e.target.value.replace(/[^0-9]/g, "") })} />
+          </div>
+        </div>
+        <div className="mb-3">
+          <label className="form-label small mb-1">Description</label>
+          <input className="form-control form-control-sm" value={addForm.description} onChange={(e) => setAddForm({ ...addForm, description: e.target.value })} />
+        </div>
+        <br/>
+        <div className="row g-2 mb-3">
+          <div className="col-12">
+            <label className="form-label small mb-1">Regions</label>
+            <div className="d-flex flex-wrap gap-1">
+              {regions.map((r) => (
+                <label key={r.region_id} className="form-check form-check-inline mb-0 me-1" style={{ fontSize: "0.8rem" }}>
+                  <input
+                    type="checkbox"
+                    className="form-check-input"
+                    checked={addForm.selectedRegionIds.includes(r.region_id)}
+                    onChange={(e) => {
+                      setAddForm((prev) => ({
+                        ...prev,
+                        selectedRegionIds: e.target.checked
+                          ? [...prev.selectedRegionIds, r.region_id]
+                          : prev.selectedRegionIds.filter((id) => id !== r.region_id),
+                      }));
+                    }}
+                  />
+                  <span className="form-check-label" title={r.name}>{r.state_code}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+        </div>
+        <div className="d-flex justify-content-end">
+          <Button size="sm" onClick={handleAdd} loading={saving}>Add</Button>
+        </div>
+      </Modal>
+      <RowViewModal
+        show={Boolean(viewRow)}
+        onHide={() => setViewRow(null)}
+        title="Door"
+        fields={viewRow ? [
+          
+          { label: "Item Name", value: viewRow.name ?? "—" },
+           { label: "Description", value: viewRow.description ?? "—", full: true },         
+          { label: "Price", value: formatCurrency(viewRow.price) },      
+           { label: "Type", value: doorWindowTypeLabel(fixedType || viewRow.item_type) },   
+          { label: "Sort Order", value: viewRow.sort_order ?? "—" },
+          { label: "Regions", value: formatRegionNames(regions, regionSelections[viewRow.item_id] ?? originalRegionRef.current[String(viewRow.item_id)] ?? []), full: true },
+        ] : []}
+      />
+
+    </div>
+  );
+}
+
+// ─── COLOR EDITOR ──────────────────────────────────────────
+
+function ColorEditor({ featureId, groups, onRefresh }) {
+  const [expandedGroup, setExpandedGroup] = useState(groups[0]?.color_group_id ?? null);
+  const [groupOptions, setGroupOptions] = useState({});
+  const [loadingGroup, setLoadingGroup] = useState(null);
+  const [addGroupOpen, setAddGroupOpen] = useState(false);
+  const [addGroupName, setAddGroupName] = useState("");
+  const [addOptOpen, setAddOptOpen] = useState(null); // color_group_id or null
+  const [addOptForm, setAddOptForm] = useState({ name: "", hex_code: "#888888", upcharge: "0" });
+
+  // Load options when a group is expanded
+  useEffect(() => {
+    if (!expandedGroup || groupOptions[expandedGroup]) return;
+    let cancelled = false;
+    loadColorOptions(expandedGroup).then((opts) => {
+      if (!cancelled) setGroupOptions((prev) => ({ ...prev, [expandedGroup]: opts }));
+    }).catch((err) => { if (!cancelled) toastError(err.message); });
+    return () => { cancelled = true; };
+  }, [expandedGroup, groupOptions]);
+
+  const refreshGroup = async (groupId) => {
+    const opts = await loadColorOptions(groupId);
+    setGroupOptions((prev) => ({ ...prev, [groupId]: opts }));
+  };
+
+  const handleAddGroup = async () => {
+    if (!addGroupName.trim()) { toastError("Group name required"); return; }
+    try {
+      await upsertColorGroup({ feature_id: featureId, name: addGroupName.trim(), sort_order: groups.length + 1 });
+      setAddGroupName("");
+      setAddGroupOpen(false);
+      toastSuccess("Color group added");
+      await onRefresh();
+    } catch (err) { toastError(err.message); }
+  };
+
+  const handleDeleteGroup = async (groupId, name) => {
+    try {
+      await deleteColorGroup(groupId);
+      toastSuccess(`Group "${name}" removed`);
+      setGroupOptions((prev) => { const n = { ...prev }; delete n[groupId]; return n; });
+      await onRefresh();
+    } catch (err) { toastError(err.message); }
+  };
+
+  const handleAddOpt = async (groupId) => {
+    if (!addOptForm.name.trim()) { toastError("Color name required"); return; }
+    try {
+      await upsertColorOption({
+        color_group_id: groupId,
+        name: addOptForm.name.trim(),
+        hex_code: addOptForm.hex_code,
+        upcharge: parseFloat(addOptForm.upcharge) || 0,
+        sort_order: (groupOptions[groupId]?.length ?? 0) + 1,
+      });
+      setAddOptForm({ name: "", hex_code: "#888888", upcharge: "0" });
+      setAddOptOpen(null);
+      toastSuccess("Color added");
+      await refreshGroup(groupId);
+    } catch (err) { toastError(err.message); }
+  };
+
+  const handleDeleteOpt = async (optId, groupId) => {
+    try {
+      await deleteColorOption(optId);
+      toastSuccess("Color removed");
+      await refreshGroup(groupId);
+    } catch (err) { toastError(err.message); }
+  };
+
+  const handleUpdateOpt = async (opt, groupId) => {
+    try {
+      await upsertColorOption(opt);
+      toastSuccess("Color updated");
+      await refreshGroup(groupId);
+    } catch (err) { toastError(err.message); }
+  };
+
+  return (
+    <div>
+      <div className="d-flex justify-content-between align-items-center mb-3">
+        <h6 className="mb-0">Color Groups ({groups.length})</h6>
+        <Button size="sm" onClick={() => setAddGroupOpen(true)}><FontAwesomeIcon icon={faPlus} /> Group</Button>
+      </div>
+
+      {groups.map((group) => {
+        const isOpen = expandedGroup === group.color_group_id;
+        const opts = groupOptions[group.color_group_id] ?? [];
+        const isLoading = loadingGroup === group.color_group_id;
+        return (
+          <div key={group.color_group_id} className="card mb-2">
+            <div className="card-header d-flex justify-content-between align-items-center py-2" style={{ cursor: "pointer" }}
+              onClick={() => setExpandedGroup(isOpen ? null : group.color_group_id)}>
+              <div>
+                <span className="fw-semibold">{group.name}</span>
+                <span className="text-muted small ms-2">({opts.length || "…"} colors)</span>
+              </div>
+              <div className="d-flex align-items-center gap-2">
+                <Button size="sm" variant="danger" onClick={(e) => { e.stopPropagation(); handleDeleteGroup(group.color_group_id, group.name); }}>×</Button>
+                <span>{isOpen ? "−" : "+"}</span>
+              </div>
+            </div>
+            {isOpen && (
+              <div className="card-body py-2">
+                {!groupOptions[group.color_group_id] ? <p className="text-muted small mb-0">Loading...</p> : (
+                  <>
+                    <div className="d-flex flex-wrap gap-2 mb-2">
+                      {opts.map((opt) => (
+                        <ColorSwatch key={opt.color_option_id} opt={opt} groupId={group.color_group_id} onUpdate={handleUpdateOpt} onDelete={handleDeleteOpt} />
+                      ))}
+                    </div>
+                    <Button size="sm" variant="outline-primary" onClick={() => { setAddOptOpen(group.color_group_id); setAddOptForm({ name: "", hex_code: "#888888", upcharge: "0" }); }}><FontAwesomeIcon icon={faPlus} /> Color</Button>
+                  </>
+                )}
+                {addOptOpen === group.color_group_id && (
+                  <div className="mt-2 p-2 border rounded bg-light">
+                    <div className="d-flex gap-2 align-items-end flex-wrap">
+                      <div style={{ minWidth: 150 }}>
+                        <label className="form-label small mb-1">Name *</label>
+                        <input className="form-control form-control-sm" value={addOptForm.name} onChange={(e) => setAddOptForm({ ...addOptForm, name: e.target.value })} />
+                      </div>
+                      <div style={{ minWidth: 60 }}>
+                        <label className="form-label small mb-1">Color</label>
+                        <input type="color" className="form-control form-control-sm form-control-color" value={addOptForm.hex_code} onChange={(e) => setAddOptForm({ ...addOptForm, hex_code: e.target.value })} />
+                      </div>
+                      <div style={{ minWidth: 80 }}>
+                        <label className="form-label small mb-1">Upcharge</label>
+                        <input className="form-control form-control-sm" value={addOptForm.upcharge} onChange={(e) => setAddOptForm({ ...addOptForm, upcharge: e.target.value })} />
+                      </div>
+                      <div className="d-flex gap-1">
+                        <Button size="sm" onClick={() => handleAddOpt(group.color_group_id)}>Add</Button>
+                        <Button size="sm" variant="secondary" onClick={() => setAddOptOpen(null)}>Cancel</Button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })}
+
+      <Modal title="Add Color Group" show={addGroupOpen} onHide={() => setAddGroupOpen(false)}>
+        <div className="d-flex gap-2 align-items-end">
+          <div style={{ flex: 1 }}>
+            <label className="form-label small mb-1">Group Name *</label>
+            <input className="form-control form-control-sm" value={addGroupName} onChange={(e) => setAddGroupName(e.target.value)} placeholder="e.g. Wainscot" />
+          </div>
+          <Button size="sm" onClick={handleAddGroup}>Create</Button>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+function ColorSwatch({ opt, groupId, onUpdate, onDelete }) {
+  const [editing, setEditing] = useState(false);
+  const [form, setForm] = useState({ name: opt.name, hex_code: opt.hex_code, upcharge: opt.upcharge });
+
+  if (editing) {
+    return (
+      <div className="p-2 border rounded bg-light" style={{ minWidth: 200 }}>
+        <div className="mb-1">
+          <input className="form-control form-control-sm" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
+        </div>
+        <div className="d-flex gap-2 mb-1">
+          <input type="color" className="form-control form-control-sm form-control-color" value={form.hex_code} onChange={(e) => setForm({ ...form, hex_code: e.target.value })} />
+          <input className="form-control form-control-sm" placeholder="Upcharge" value={form.upcharge} onChange={(e) => setForm({ ...form, upcharge: e.target.value })} style={{ width: 80 }} />
+        </div>
+        <div className="d-flex gap-1">
+          <Button size="sm" onClick={() => { onUpdate({ ...opt, name: form.name, hex_code: form.hex_code, upcharge: parseFloat(form.upcharge) || 0 }, groupId); setEditing(false); }}>Save</Button>
+          <Button size="sm" variant="secondary" onClick={() => setEditing(false)}>Cancel</Button>
+          <Button size="sm" variant="danger" onClick={() => onDelete(opt.color_option_id, groupId)}>Delete</Button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="text-center" style={{ cursor: "pointer" }} title={`${opt.name} (${opt.hex_code})${Number(opt.upcharge) > 0 ? ` +$${opt.upcharge}` : ""}`} onClick={() => { setEditing(true); setForm({ name: opt.name, hex_code: opt.hex_code, upcharge: opt.upcharge }); }}>
+      <div style={{ width: 36, height: 36, borderRadius: "50%", background: opt.hex_code, border: "2px solid #ccc", margin: "0 auto" }} />
+      <div className="small text-truncate" style={{ maxWidth: 60, fontSize: "0.65rem" }}>{opt.name}</div>
+      {Number(opt.upcharge) > 0 && <div style={{ fontSize: "0.6rem" }} className="text-muted">+${opt.upcharge}</div>}
+    </div>
+  );
+}
+
+// ─── EDIT FEATURE BUTTON ───────────────────────────────────
+
+function EditFeatureButton({ feature, categories, pricingTypes, onUpdated }) {
+  const [open, setOpen] = useState(false);
+  const [form, setForm] = useState({ name: feature.name ?? "", pricing_type_id: feature.pricing_type_id ?? "", category_id: feature.category_id ?? "", description: feature.description ?? "" });
+
+  const handleSave = async () => {
+    if (!form.name.trim()) { toastError("Name is required"); return; }
+    if (!form.pricing_type_id) { toastError("Pricing type is required"); return; }
+    try {
+      const updated = await updateFeature(feature.feature_id, {
+        name: form.name.trim(),
+        pricing_type_id: parseInt(form.pricing_type_id),
+        category_id: form.category_id ? parseInt(form.category_id) : null,
+        description: form.description,
+      });
+      toastSuccess(`Feature "${updated.name}" updated`);
+      onUpdated(updated);
+      setOpen(false);
+    } catch (err) { toastError(err.message); }
+  };
+
+  return (
+    <>
+      <Button size="sm" variant="ghost" onClick={() => setOpen(true)} title="Edit feature">
+        <FontAwesomeIcon icon={faPen} />
+      </Button>
+      <Modal title="Edit Feature" show={open} onHide={() => setOpen(false)}>
+        <div className="mb-2">
+          <label className="form-label small">Name *</label>
+          <input className="form-control form-control-sm" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
+        </div>
+        <div className="mb-2">
+          <label className="form-label small">Pricing Type *</label>
+          <select className="form-select form-select-sm" value={form.pricing_type_id} onChange={(e) => setForm({ ...form, pricing_type_id: e.target.value })}>
+            {pricingTypes.map((pt) => <option key={pt.pricing_type_id} value={pt.pricing_type_id}>{pt.label}</option>)}
+          </select>
+        </div>
+        <div className="mb-2">
+          <label className="form-label small">Category</label>
+          <select className="form-select form-select-sm" value={form.category_id} onChange={(e) => setForm({ ...form, category_id: e.target.value })}>
+            <option value="">— None —</option>
+            {categories.map((c) => <option key={c.category_id} value={c.category_id}>{c.name}</option>)}
+          </select>
+        </div>
+        <div className="mb-3">
+          <label className="form-label small">Description</label>
+          <input className="form-control form-control-sm" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} />
+        </div>
+        <div className="d-flex justify-content-end gap-2">
+          <Button variant="secondary" size="sm" onClick={() => setOpen(false)}>Cancel</Button>
+          <Button size="sm" onClick={handleSave}>Save</Button>
+        </div>
+      </Modal>
+    </>
+  );
+}
+
+
+// ─── ADD FEATURE BUTTON ────────────────────────────────────
+
+function AddFeatureButton({ pricingTypes, categories, onCreated }) {
+  const [open, setOpen] = useState(false);
+  const [form, setForm] = useState({ name: "", pricing_type_id: pricingTypes[0]?.pricing_type_id ?? "", category_id: "", description: "" });
+
+  const handleCreate = async () => {
+    if (!form.name.trim()) { toastError("Name is required"); return; }
+    if (!form.pricing_type_id) { toastError("Pricing type is required"); return; }
+    const pt = pricingTypes.find((p) => p.pricing_type_id === parseInt(form.pricing_type_id));
+    const cat = categories.find((c) => c.category_id === parseInt(form.category_id));
+    try {
+      const created = await createFeature({
+        name: form.name.trim(),
+        pricing_type_id: parseInt(form.pricing_type_id),
+        pricing_type_code: pt?.code ?? "",
+        category_id: form.category_id ? parseInt(form.category_id) : null,
+        category_name: cat?.name ?? null,
+        description: form.description,
+      });
+      toastSuccess(`Feature "${created.name}" created`);
+      onCreated(created);
+      setOpen(false);
+      setForm({ name: "", pricing_type_id: pricingTypes[0]?.pricing_type_id ?? "", category_id: "", description: "" });
+    } catch (err) { toastError(err.message); }
+  };
+
+  return (
+    <>
+      <Button size="sm" variant="ghost" onClick={() => setOpen(true)} title="Add feature">
+        <FontAwesomeIcon icon={faPlus} />
+      </Button>
+      <Modal title="Add Feature" show={open} onHide={() => setOpen(false)}>
+          <div className="mb-2">
+            <label className="form-label small">Name *</label>
+            <input className="form-control form-control-sm" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
+          </div>
+          <div className="mb-2">
+            <label className="form-label small">Pricing Type *</label>
+            <select className="form-select form-select-sm" value={form.pricing_type_id} onChange={(e) => setForm({ ...form, pricing_type_id: e.target.value })}>
+              {pricingTypes.map((pt) => <option key={pt.pricing_type_id} value={pt.pricing_type_id}>{pt.label}</option>)}
+            </select>
+          </div>
+          <div className="mb-2">
+            <label className="form-label small">Category</label>
+            <select className="form-select form-select-sm" value={form.category_id} onChange={(e) => setForm({ ...form, category_id: e.target.value })}>
+              {categories.map((c) => <option key={c.category_id} value={c.category_id}>{c.name}</option>)}
+            </select>
+          </div>
+          <div className="mb-3">
+            <label className="form-label small">Description</label>
+            <input className="form-control form-control-sm" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} />
+          </div>
+          <div className="d-flex justify-content-end gap-2">
+            <Button variant="secondary" size="sm" onClick={() => setOpen(false)}>Cancel</Button>
+            <Button size="sm" onClick={handleCreate}>Create</Button>
+          </div>
+        </Modal>
+    </>
+  );
+}

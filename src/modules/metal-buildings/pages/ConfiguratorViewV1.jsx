@@ -1,0 +1,5654 @@
+"use client";
+// ═══════════════════════════════════════════════════════════
+// ConfiguratorViewV1 — Calculation-focused configurator.
+// 3D preview renders via BuildingPreviewV2 (same renderer and
+// prop wiring as ConfiguratorViewV2). Calculations unchanged.
+// ═══════════════════════════════════════════════════════════
+
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import dynamic from "next/dynamic";
+import AppIcon from "@/shared/components/ui/AppIcon";
+import { Button, toastWarning } from "@/shared/components/ui";
+import {
+  getUniqueDimensionValues,
+  getLegHeightValues,
+  applyRegionMultiplier,
+  calcPanelOptionPrice,
+  calcTotalPanelPrice,
+  lookupWallPanelPrices,
+  lookupWallPanelPrice,
+  getCustomWallOptions,
+  findCustomWallRow,
+  deriveCustomRenderType,
+  leantoCustomWallItems,
+  leantoWallLabel,
+  deriveCustomSidingStyle,
+  calcCustomTotalWallPrice,
+  formatCurrency,
+  lookupLegHeightPrice as lookupLegHeightPriceClient,
+  lookupOptionByDimensions,
+  lookupFeatureRate,
+  calculateGutterPricing,
+  findLeantoFeature,
+  resolveStyleDefaultDim,
+  mergeDimValue,
+  buildDefaultRoofOverhangAddOn,
+  parseOpeningDimensions,
+  resolveDefaultColorSelections,
+  resolveSelectedColorOption,
+  resolveDefaultAddOns,
+  resolveDefaultOpenings,
+  mergeActiveWindowOptions,
+  formatUpcharge,
+  formatColorLabel,
+  isColorGroupVisible,
+} from "../data/metalBuildings.data";
+import EstimateDetailsDrawer from "../components/EstimateDetailsDrawer";
+import { buildEstimate } from "../components/estimateDrawer.utils";
+import { getStyleProfile, isFeatureAllowed, isAccessoryAllowed, resolveStyleKey, getDefaultWallMode } from "../data/styleProfiles";
+import { getStyleIconPath } from "../data/styleIcons";
+import { resolveOpeningType } from "../data/openings";
+import { findRegionByZipCode, addZipCodeAction, lookupZipDetailsAction, lookupRegionBasePrice, lookupRoofStyleBasePrice, lookupLeantoBasePrice, lookupConnectionFee, lookupLegHeightPrice, findSnowLoadByZipCode, addSnowLoadForZipCode, findSnowLoadRateByWidth } from "../data/metalBuildings.actions";
+import useTaxRate from "../components/useTaxRate";
+import "./configuratorV1.css";
+
+// ─── 3D PREVIEW (client-only) ─────────────────────────────
+// Same renderer as ConfiguratorViewV2 (BuildingPreviewV2).
+const BuildingPreview = dynamic(() => import("./BuildingPreviewV2"), { ssr: false });
+
+// ─── DEFAULT INSTALLATION SURFACE ─────────────────────────
+const DEFAULT_INSTALLATION_SURFACE = "Concrete";
+
+function buildInstallationSurfaceDefault(features, options) {
+  const feat = features.find((f) => f.name === "Installation Surface" || f.render_key === "installation_surface");
+  if (!feat) return null;
+  const opt = options.find((o) => o.feature_id === feat.feature_id && o.name === DEFAULT_INSTALLATION_SURFACE);
+  if (!opt) return null;
+  return { featureId: feat.feature_id, featureName: feat.name, description: opt.name, price: Number(opt.price) };
+}
+
+// ─── DEFAULT FRAME GAUGE ──────────────────────────────────
+// The "Frame Gauge" add-on lists its options from metal_s_framing (see
+// FramingSelector below). Default-select the 14 gauge framing on first load
+// and whenever add-on defaults are reset. Framing rows carry no price — the
+// add-on price is 0 (framing cost is applied via the base structure matrix).
+const DEFAULT_FRAME_GAUGE = "14";
+
+function buildDefaultFrameGaugeAddOn(features, framings) {
+  const feat = features.find((f) => isFrameGaugeFeature(f));
+  if (!feat) return null;
+  // Match "14" as a standalone number so "14-Framing Gauge", "14-Gauge
+  // Framing", etc. all resolve, without matching 14 inside another number.
+  const gaugeRe = new RegExp(`(^|\\D)${DEFAULT_FRAME_GAUGE}(\\D|$)`);
+  const framing = (framings ?? []).find((f) => gaugeRe.test(String(f.framing_name ?? "")));
+  if (!framing) return null;
+  return { featureId: feat.feature_id, featureName: feat.name, description: framing.framing_name, price: 0 };
+}
+
+// ─── DEFAULT PANEL UPGRADE ────────────────────────────────
+// "Panel Upgrade" (metal_s_feature, FIXED) — options in metal_s_feature_option:
+// Standard 29ga Panel ($0), 26ga AG Panel, 26ga PBR Panel (flat prices).
+// Always listed in the Materials tab; the no-charge option (lowest price,
+// then sort order) is pre-selected on first load and on style change.
+const isPanelUpgradeFeature = (f) =>
+  String(f?.name ?? "").trim().toLowerCase().replace(/\s+/g, " ") === "panel upgrade";
+
+function buildPanelUpgradeDefault(features, options) {
+  const feat = (features ?? []).find(isPanelUpgradeFeature);
+  if (!feat) return null;
+  const opts = (options ?? [])
+    .filter((o) => o.feature_id === feat.feature_id)
+    .sort((a, b) => (Number(a.price) - Number(b.price)) || ((a.sort_order ?? 0) - (b.sort_order ?? 0)));
+  const opt = opts[0];
+  if (!opt) return null;
+  return { featureId: feat.feature_id, featureName: feat.name, description: opt.name, price: Number(opt.price) };
+}
+
+// ─── ROOF OVERHANG NAME NORMALIZATION ─────────────────────
+// Normalize an overhang option label to a comparable size key. Quote-style
+// marks are treated as equivalent and stripped: the UI renders `12"` (inch
+// mark) while DB rows may be named `12'` (foot mark) or `12` for the same
+// 12-inch overhang. `6"` ≡ `6'` ≡ `6` → 6; `12"` ≡ `12'` ≡ `12` → 12.
+function normalizeOverhangName(name) {
+  if (name == null) return null;
+  const cleaned = String(name).trim().replace(/['"″′”’]/g, "").trim();
+  const num = Number(cleaned);
+  return Number.isFinite(num) && cleaned !== "" ? num : cleaned.toLowerCase();
+}
+
+// ─── ROOF PITCH NAME NORMALIZATION ────────────────────────
+// Normalize a pitch option label to a comparable rise key. The UI renders
+// `4/12` while DB rows may be named `4:12` or `4` for the same 4/12 pitch.
+// `4/12` ≡ `4:12` ≡ `4` → 4.
+function normalizePitchName(name) {
+  if (name == null) return null;
+  const cleaned = String(name).trim();
+  const m = cleaned.match(/^(\d+(?:\.\d+)?)\s*[/:]\s*\d+/);
+  if (m) return Number(m[1]);
+  const num = Number(cleaned);
+  return Number.isFinite(num) && cleaned !== "" ? num : cleaned.toLowerCase();
+}
+
+// ─── LEAN-TO SIDE ICON (Sides & Ends picker) ───────────────
+// Flat top-down building with ribbed roof panels; the lean-to for `side` is
+// the dark band on that edge — Back = top, Front = bottom, Left = left,
+// Right = right (same positions as the picker layout).
+const LTS_BANDS = {
+  back: { x: 16, y: 4, w: 28, h: 9 },
+  front: { x: 16, y: 47, w: 28, h: 9 },
+  left: { x: 7, y: 13, w: 9, h: 34 },
+  right: { x: 44, y: 13, w: 9, h: 34 },
+};
+
+function LeantoSideIcon({ side }) {
+  const band = LTS_BANDS[side];
+  const ribs = [];
+  for (let y = 16; y < 46; y += 3) ribs.push(y);
+  const bandLines = band
+    ? [1, 2].map((i) => (band.w > band.h
+      ? { x1: band.x, y1: band.y + (band.h * i) / 3, x2: band.x + band.w, y2: band.y + (band.h * i) / 3 }
+      : { x1: band.x + (band.w * i) / 3, y1: band.y, x2: band.x + (band.w * i) / 3, y2: band.y + band.h }))
+    : [];
+  return (
+    <svg viewBox="0 0 60 60" width="56" height="56" aria-hidden="true">
+      <rect x="16" y="13" width="28" height="34" fill="#eef0f2" stroke="#9aa2ab" strokeWidth="1" />
+      {ribs.map((y) => <line key={y} x1="17" y1={y} x2="43" y2={y} stroke="#b9c0c7" strokeWidth="0.8" />)}
+      {band && <rect x={band.x} y={band.y} width={band.w} height={band.h} fill="#34465f" />}
+      {bandLines.map((l, i) => <line key={`b${i}`} {...l} stroke="#5a6d88" strokeWidth="0.8" />)}
+    </svg>
+  );
+}
+
+// ─── ROOF PITCH OPTIONS (metal_s_feature_option) ──────────
+// The Roof Pitch feature and its option rows (names + multiplier factors)
+// live in the database — the UI never hardcodes pitch choices or factors.
+function findRoofPitchFeature(features) {
+  return features.find((f) => f.render_key === "roof_pitch")
+    ?? features.find((f) => String(f.name ?? "").toLowerCase().includes("pitch"))
+    ?? null;
+}
+
+// Distinct pitch names from metal_s_feature_option for the Roof Pitch feature,
+// ordered by sort_order/option_id and deduped by rise (width-band rows share
+// the same pitch). The first entry serves as the default selection.
+function getRoofPitchOptionNames(features, options) {
+  const feat = findRoofPitchFeature(features);
+  if (!feat) return [];
+  const rows = (options ?? [])
+    .filter((o) => o.feature_id === feat.feature_id && o.is_active !== false)
+    .sort((a, b) => ((a.sort_order ?? 0) - (b.sort_order ?? 0)) || ((a.option_id ?? 0) - (b.option_id ?? 0)));
+  const seen = new Set();
+  const names = [];
+  for (const o of rows) {
+    const key = normalizePitchName(o.name);
+    if (key == null || seen.has(key)) continue;
+    seen.add(key);
+    names.push(String(o.name ?? "").trim());
+  }
+  return names;
+}
+
+// Default lean-to pitch — "2/12" when configured (matched by rise 2 regardless
+// of spelling: `2/12`, `2:12`, or `2`), else the first DB-listed pitch.
+function defaultPitchOption(pitchNames) {
+  return pitchNames.find((p) => Number(normalizePitchName(p)) === 2) ?? pitchNames[0] ?? "";
+}
+
+// metal_s_feature_option row for a pitch selection scoped to a width/length
+// band (NULL bounds = unbounded). Shared by the main building and lean-to
+// pitch upcharges.
+function findPitchMultiplierRow(options, feature, pitchName, w, l) {
+  if (!feature || !pitchName) return null;
+  const wantRise = normalizePitchName(pitchName);
+  const candidates = (options ?? [])
+    .filter((o) => o.feature_id === feature.feature_id && o.is_active !== false && normalizePitchName(o.name) === wantRise)
+    .sort((a, b) => ((a.sort_order ?? 0) - (b.sort_order ?? 0)) || ((a.option_id ?? 0) - (b.option_id ?? 0)));
+  return candidates.find((o) => {
+    const minW = o.min_width != null ? Number(o.min_width) : null;
+    const maxW = o.max_width != null ? Number(o.max_width) : null;
+    const minL = o.min_length != null ? Number(o.min_length) : null;
+    const maxL = o.max_length != null ? Number(o.max_length) : null;
+    if (minW != null && w < minW) return false;
+    if (maxW != null && w > maxW) return false;
+    if (minL != null && l < minL) return false;
+    if (maxL != null && l > maxL) return false;
+    return true;
+  }) ?? null;
+}
+
+const FALLBACK_LT_WIDTHS = [6, 8, 10, 12, 14, 16, 18, 20, 24];
+const FALLBACK_LT_HEIGHTS = [4, 5, 6, 7, 8, 9, 10, 12];
+const FALLBACK_LT_LENGTHS = [10, 12, 14, 16, 18, 20, 24, 30, 36, 40, 45, 50, 60];
+
+// Storage location options (Center Storage — display only, not wired to pricing/3D yet)
+const STORAGE_LOCATIONS = [
+  { value: "none", label: "None" },
+  { value: "front", label: "Front" },
+  { value: "back", label: "Back" },
+  { value: "left", label: "Left Side" },
+  { value: "right", label: "Right Side" },
+];
+
+// Storage depth options (placeholder — not wired to pricing/3D yet)
+const STORAGE_DEPTHS = [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
+// Center Storage opening buckets — one list per selectable storage wall.
+const EMPTY_STORAGE_OPENINGS = { outer: [], inner: [], front_end: [], back_end: [], left_end: [], right_end: [] };
+
+// Storage wall keys — used to route 3D drag moves into the storageOpenings
+// bucket instead of the center-section doorWindowSelections bucket.
+const STORAGE_WALL_KEYS = new Set(Object.keys(EMPTY_STORAGE_OPENINGS));
+
+// Shared move plumbing for an opening list (center or storage): writes posFt
+// (feet from wall center) and a sillFt that only applies to windows/vents/
+// frameouts (doors stay on the floor). Returns the new list, or null to bail.
+function applyOpeningMove(list, idx, posFt, sillFt = 0) {
+  if (!list || idx < 0 || idx >= list.length) return null;
+  const next = [...list];
+  const item = next[idx];
+  const declared = String(item.item_type ?? "").trim().toLowerCase();
+  const name = String(item.name ?? "").toLowerCase();
+  const type = declared || (name.includes("window") ? "window"
+    : name.includes("roll") ? "rollup_door"
+    : name.includes("frameout") ? "frameout"
+    : name.includes("vent") ? "vent" : "door");
+  const sill = (type === "window" || type === "vent" || type === "frameout")
+    ? Math.max(0, Number(sillFt) || 0)
+    : 0;
+  next[idx] = { ...item, posFt, sillFt: sill };
+  return next;
+}
+
+// Lean-to feature UI defaults. Corner wraps render in the 3D preview (pricing stays display-only); roofPitch drives the
+// lean-to's roof slope + pitch upcharge, roofStyle and sideConnection feed the
+// estimate & pricing. Pitch defaults to "" and is normalized to the 2/12
+// default (defaultPitchOption) at render.
+const LT_WRAP_OPTIONS = ["No Wrap", "Standard Roofline"];
+// Lean short names for the corner-wrap labels ("Wrap Left Lean around ..." ).
+const LT_SIDE_SHORT_NAMES = { left: "Left Lean", right: "Right Lean", front: "Front Lean", back: "Back Lean" };
+// Per-lean-to Roof Style (values match metal_m_feature_matrix_price.roof_stye
+// for the Roof Style matrix lookup).
+const LT_ROOF_STYLE_OPTIONS = [
+  { value: "Vertical", label: "A-Frame Vertical" },
+  { value: "Horizontal", label: "A-Frame Horizontal" },
+];
+// Per-lean-to Side Connection. "standard" is priced from the DB-configured
+// "Side Connection Fee" option (metal_s_feature_option) — no hardcoded price.
+const LT_CONNECTION_OPTIONS = [
+  { value: "standard", label: "Standard Side Connection" },
+  { value: "none", label: "None" },
+];
+const LT_UI_DEFAULTS = {
+  roofPitch: "",
+  wrapFront: "No Wrap",
+  wrapBack: "No Wrap",
+  wrapLeft: "No Wrap",
+  wrapRight: "No Wrap",
+  roofStyle: "Vertical",
+  sideConnection: "standard",
+  storageDepth: 9,
+};
+
+// Wall mode presets for lean-tos (mirrors NorthEdge: Fully Enclosed / Fully Open / Gable Ends / Customize)
+const LT_WALL_MODES = [
+  { key: "enclosed", label: "Fully Enclosed" },
+  { key: "open", label: "Fully Open" },
+  { key: "gable", label: "Gable Ends" },
+  { key: "custom", label: "Customize by Wall" },
+];
+
+function applyLtWallMode(mode) {
+  if (mode === "enclosed") return { outer: "enclosed", left_end: "enclosed", right_end: "enclosed" };
+  if (mode === "open") return { outer: "open", left_end: "open", right_end: "open" };
+  if (mode === "gable") return { outer: "open", left_end: "gable", right_end: "gable" };
+  return null; // custom — don't change
+}
+
+// Default front-wall frameout for a lean-to. Prefers a real priced frameout
+// row from the DB; falls back to a synthetic 8'×7' entry so the opening always
+// renders (parseOpening reads the dimensions from the name).
+function defaultLeantoFrontFrameout(doorWindowItems, { widthFt = 8, heightFt = 7 } = {}) {
+  const resolved = resolveDefaultOpenings(doorWindowItems, [{ wall: "front", type: "frameout", widthFt, heightFt }]).front[0];
+  if (resolved) return resolved;
+  return { item_id: null, name: `${widthFt}' x ${heightFt}' Frameout`, price: 0, item_type: "frameout" };
+}
+
+// Maps Rain Gutters UI labels to calculateGutterPricing gutterSelection keys.
+const RAIN_GUTTER_SIDE_KEY = {
+  "Left Side Gutters": "left",
+  "Right Side Gutters": "right",
+  "Both Sides Gutters": "both",
+};
+// Default Rain Gutters side when "Gutters" is selected (and on style change).
+const DEFAULT_RAIN_GUTTERS = "Both Sides Gutters";
+
+// The Standard (Regular) Carport is the only style with side-based downspout
+// defaults: Both Sides Gutters → 4, one side (Left/Right) → 2. All other
+// styles default to 0.
+function isStandardCarportStyle(styleRow) {
+  const key = String(styleRow?.render_key ?? "").toLowerCase().replace(/[-\s]/g, "_");
+  const name = String(styleRow?.name ?? "").toLowerCase();
+  return key.includes("regular") || key.includes("standard") ||
+    name.includes("regular") || name.includes("standard");
+}
+
+function getDefaultDownspoutCount(styleRow, rainGuttersSelection) {
+  if (!isStandardCarportStyle(styleRow)) return 0;
+  return rainGuttersSelection === "Both Sides Gutters" ? 4 : 2;
+}
+
+// ─── DOWNSPOUT PRICING (metal_s_feature_option) ────────────
+// The downspout base price is the `price` column of an active
+// metal_s_feature_option row. DB naming varies ("Downspout", "Down Spout",
+// "Downspouts", "2x3 Downspout", "Downpipe", or a combined "Gutter &
+// Downspout" feature — render_key often null), so match loosely (letters and
+// digits only) and search in priority order (each tier by sort_order, then
+// option_id):
+//   1. downspout-named option under a downspout-named feature
+//   2. any option under a downspout-named feature
+//   3. downspout-named option under any feature
+//   4. any option under the gutter feature (combined "Gutter & Downspout" rows)
+// Returns null when no valid price is found — no hardcoded fallback.
+function lookupDownspoutBasePrice(features, options) {
+  const alnum = (v) => String(v ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const isDownspoutish = (v) => {
+    const s = alnum(v);
+    return s.includes("downspout") || s.includes("downpipe");
+  };
+  const isGutterish = (v) => alnum(v).includes("gutter");
+  const bySort = (a, b) => ((a.sort_order ?? 0) - (b.sort_order ?? 0)) || ((a.option_id ?? 0) - (b.option_id ?? 0));
+
+  const activeOptions = (options ?? []).filter((o) => o.is_active !== false);
+  const featureList = features ?? [];
+  const downspoutFeature = featureList.find((f) => isDownspoutish(f.name) || isDownspoutish(f.render_key)) ?? null;
+  const gutterFeature = featureList.find((f) => isGutterish(f.name) || isGutterish(f.render_key)) ?? null;
+
+  const tiers = [
+    downspoutFeature ? activeOptions.filter((o) => o.feature_id === downspoutFeature.feature_id && isDownspoutish(o.name)) : [],
+    downspoutFeature ? activeOptions.filter((o) => o.feature_id === downspoutFeature.feature_id) : [],
+    activeOptions.filter((o) => isDownspoutish(o.name)),
+    gutterFeature ? activeOptions.filter((o) => o.feature_id === gutterFeature.feature_id) : [],
+  ];
+
+  for (const tier of tiers) {
+    for (const row of [...tier].sort(bySort)) {
+      const price = Number(row?.price);
+      if (Number.isFinite(price) && price > 0) return price;
+    }
+  }
+  return null;
+}
+
+// Pure downspout price calculation. No side effects, no UI access.
+//
+// Pricing rule (heights in feet, prices in USD):
+//   Price = basePrice × (tallestSidewallHeight + 1.5) × downspoutCount
+//
+// basePrice comes from metal_s_feature_option.price (lookupDownspoutBasePrice).
+// Validation: downspoutCount clamps to an integer 0-10; a missing/invalid base
+// price or sidewall height yields 0 (no hardcoded fallback). Result is rounded
+// to 2 decimals.
+function computeDownspoutPrice({ basePrice, tallestSidewallHeight, downspoutCount = 0 } = {}) {
+  const price = Number(basePrice);
+  if (!Number.isFinite(price) || price <= 0) return 0;
+  // A missing height (null/undefined/"") means no downspout pricing — note
+  // Number(null) === 0, so it must be rejected before numeric conversion.
+  // A genuine 0-ft sidewall is still valid (run = 1.5 ft).
+  if (tallestSidewallHeight == null || tallestSidewallHeight === "") return 0;
+  const heightFt = Number(tallestSidewallHeight);
+  if (!Number.isFinite(heightFt) || heightFt < 0) return 0;
+  const count = Math.min(10, Math.max(0, Math.trunc(Number(downspoutCount) || 0)));
+  return Math.round(price * (heightFt + 1.5) * count * 100) / 100;
+}
+
+// Default siding style used when looking up Gable wall prices from
+// metal_m_panel_pricing (matches metal_m_panel_pricing.siding_style values
+// "Horizontal" / "Vertical"). Horizontal is the default; wire this to a user
+// selection later if a siding-style input is added.
+const DEFAULT_SIDING_STYLE = "Horizontal";
+
+// ─── ENGINEERING CONSTRAINTS ───────────────────────────────
+// Parse WxH dimensions from item names — delegates to the shared
+// parseOpeningDimensions so wall-fit validation matches what the 3D renderer
+// parses (`36" x 80"` → inches, `10' x 11'` → feet, bare `36×80` → inches).
+// Returns { widthFt, heightFt } or null.
+function parseItemDimensions(name) {
+  return parseOpeningDimensions(name);
+}
+
+// ─── OPENING PLACEMENT (drag-aware) ────────────────────────
+// Place a new opening on a wall that already has user-pinned (dragged) items:
+// snapshot the auto-spaced slots of unpinned items so nothing jumps, then put
+// the new item at the center of the largest free gap. Walls with no pinned
+// items keep the renderer's pure auto-spacing.
+function placeOpeningInWall(list, entry, wallLenFt) {
+  const hasPinned = list.some((e) => e.posFt != null);
+  if (!hasPinned) return [...list, entry];
+  const spacing = wallLenFt / (list.length + 1);
+  const snapshot = list.map((e, i) => (e.posFt != null ? e : { ...e, posFt: spacing * (i + 1) - wallLenFt / 2 }));
+  const wOf = (e) => parseItemDimensions(e.name)?.widthFt ?? 3;
+  const ranges = snapshot
+    .map((e) => [e.posFt - wOf(e) / 2, e.posFt + wOf(e) / 2])
+    .sort((a, b) => a[0] - b[0]);
+  const half = wallLenFt / 2;
+  const gaps = [];
+  let cursor = -half;
+  for (const [s, t] of ranges) {
+    if (s > cursor) gaps.push([cursor, s]);
+    cursor = Math.max(cursor, t);
+  }
+  if (cursor < half) gaps.push([cursor, half]);
+  gaps.sort((a, b) => (b[1] - b[0]) - (a[1] - a[0]));
+  const gap = gaps[0];
+  return [...snapshot, { ...entry, posFt: gap ? (gap[0] + gap[1]) / 2 : 0 }];
+}
+
+// Structural clearance rules
+const FRAME_CLEARANCE_FT = 1;      // min gap from each frame column
+const HEIGHT_CLEARANCE_FT = 0.17;  // min gap below eave (~2" for frame header)
+const MAX_OPENING_RATIO = 0.85;    // max total opening width vs wall width
+
+function getWallWidthFt(wallKey, section, buildingWidth, buildingLength, leantos, storage = null) {
+  if (section === "storage") {
+    if (wallKey === "outer" || wallKey === "inner") {
+      return storage?.location === "front" || storage?.location === "back" ? buildingWidth : buildingLength;
+    }
+    return Number(storage?.depthFt) || 0; // end caps span the storage depth
+  }
+  if (section === "center") {
+    if (wallKey === "front" || wallKey === "back") return buildingWidth;
+    return buildingLength; // left / right
+  }
+  // Lean-to walls
+  const lt = leantos.find((l) => l.side_key === section);
+  if (!lt) return 0;
+  if (wallKey === "outer") return lt.length_ft ?? 0;
+  return lt.width_ft ?? 0; // left_end / right_end
+}
+
+function getWallHeightFt(section, buildingHeight, leantos, wallKey) {
+  if (section === "center" || section === "storage") return buildingHeight;
+  const lt = leantos.find((l) => l.side_key === section);
+  if (!lt) return buildingHeight;
+  // End walls are trapezoids — taller at building side, shorter at outer edge
+  // Use 70% of the height range (items can be placed toward the taller building side)
+  if (wallKey === "left_end" || wallKey === "right_end") {
+    return lt.height_ft + (buildingHeight - lt.height_ft) * 0.7;
+  }
+  return lt.height_ft;
+}
+
+function validateItemForWall(item, existingItems, wallWidthFt, wallHeightFt) {
+  const dims = parseItemDimensions(item.name);
+  if (!dims) return { ok: true }; // can't validate, allow it
+
+  // Single item too wide for wall
+  if (dims.widthFt > wallWidthFt - FRAME_CLEARANCE_FT * 2) {
+    return { ok: false, reason: `${item.name} is ${dims.widthFt}' wide but this wall only allows up to ${(wallWidthFt - FRAME_CLEARANCE_FT * 2).toFixed(0)}' (${wallWidthFt}' wall minus frame clearance).` };
+  }
+
+  // Single item too tall for wall
+  if (dims.heightFt > wallHeightFt - HEIGHT_CLEARANCE_FT) {
+    return { ok: false, reason: `${item.name} is ${dims.heightFt.toFixed(1)}' tall but this wall is only ${wallHeightFt}' (need ${HEIGHT_CLEARANCE_FT}' eave clearance).` };
+  }
+
+  // Total opening width check (sum of all items + this new one)
+  const totalExisting = existingItems.reduce((sum, ex) => {
+    const d = parseItemDimensions(ex.name);
+    return sum + (d ? d.widthFt : 0);
+  }, 0);
+  const totalAfter = totalExisting + dims.widthFt;
+  const maxAllowed = wallWidthFt * MAX_OPENING_RATIO;
+  if (totalAfter > maxAllowed) {
+    return { ok: false, reason: `Adding ${item.name} would total ${totalAfter.toFixed(1)}' of openings on a ${wallWidthFt}' wall (max ${maxAllowed.toFixed(0)}').` };
+  }
+
+  return { ok: true };
+}
+
+// ─── ICON SVGs for wall items ──────────────────────────────
+const ITEM_ICONS = {
+  door: (
+    <svg viewBox="0 0 48 64" fill="none" stroke="currentColor" strokeWidth="2" width="36" height="48">
+      <rect x="8" y="4" width="32" height="56" rx="2" />
+      <circle cx="34" cy="34" r="2" fill="currentColor" />
+    </svg>
+  ),
+  window: (
+    <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" strokeWidth="2" width="36" height="36">
+      <rect x="6" y="6" width="36" height="36" rx="2" />
+      <line x1="24" y1="6" x2="24" y2="42" />
+      <line x1="6" y1="24" x2="42" y2="24" />
+    </svg>
+  ),
+  frameout: (
+    <svg viewBox="0 0 48 64" fill="none" stroke="currentColor" strokeWidth="2" width="36" height="48">
+      <rect x="4" y="2" width="40" height="60" rx="2" />
+      <rect x="8" y="6" width="32" height="52" rx="1" strokeDasharray="4 2" fill="none" />
+      <line x1="4" y1="2" x2="8" y2="6" />
+      <line x1="44" y1="2" x2="40" y2="6" />
+      <line x1="4" y1="62" x2="8" y2="58" />
+      <line x1="44" y1="62" x2="40" y2="58" />
+    </svg>
+  ),
+  rollup_door: (
+    <svg viewBox="0 0 48 64" fill="none" stroke="currentColor" strokeWidth="2" width="36" height="48">
+      <rect x="4" y="2" width="40" height="60" rx="2" />
+      <path d="M8 10 Q24 6 40 10" />
+      <line x1="8" y1="18" x2="40" y2="18" />
+      <line x1="8" y1="26" x2="40" y2="26" />
+      <line x1="8" y1="34" x2="40" y2="34" />
+      <line x1="8" y1="42" x2="40" y2="42" />
+      <line x1="8" y1="50" x2="40" y2="50" />
+      <line x1="8" y1="58" x2="40" y2="58" />
+    </svg>
+  ),
+  vent: (
+    <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" strokeWidth="2" width="36" height="36">
+      <rect x="6" y="10" width="36" height="28" rx="2" />
+      <line x1="6" y1="17" x2="42" y2="17" />
+      <line x1="6" y1="24" x2="42" y2="24" />
+      <line x1="6" y1="31" x2="42" y2="31" />
+    </svg>
+  ),
+};
+
+// ─── ADD ZIP CODE HELPERS ─────────────────────────────────
+
+function emptyAddZipDraft() {
+  return {
+    zipCode: "",
+    region: "",
+    stateCode: "",
+    city: "",
+    county: "",
+    latitude: "",
+    longitude: "",
+    // Per-field source for the confirmation summary: "api" | "manual".
+    sources: {},
+  };
+}
+
+// ─── MAIN COMPONENT ─────────────────────────────────────────
+
+// Shared width of the right configuration panel and the Estimate drawer so
+// the drawer overlays the panel exactly.
+const RIGHT_PANEL_WIDTH = "30%";
+
+export default function ConfiguratorView({ data }) {
+  const { styles, features, matrixPrices, legHeightPrices, panelLocations, panelOptions, panelPricing, panelTypes, panelPriceRegions, rates, options, framings, doorWindowItems: legacyDoorWindowItems, regionDoorWindow, customAdjustmentTypes = [], colorGroups, colorOptions, leantoStyles, leantoSides, leantoPrices, leantoCompat, styleDefaults } = data;
+  // Window variants come from the active Windows feature options. Other opening
+  // types keep their metal_s_door_window_item rows. IDs stay namespaced by source.
+  const doorWindowItems = useMemo(
+    () => mergeActiveWindowOptions(legacyDoorWindowItems, features, options),
+    [legacyDoorWindowItems, features, options]
+  );
+
+  // ─── FULL-BLEED LAYOUT (remove parent padding/max-width) ──
+  useEffect(() => {
+    const shell = document.querySelector(".app-shell-body");
+    const content = document.querySelector(".app-content");
+    if (shell) { shell.dataset.origPad = shell.style.padding; shell.style.padding = "0"; }
+    if (content) { content.dataset.origMax = content.style.maxWidth; content.style.maxWidth = "none"; }
+    return () => {
+      if (shell) shell.style.padding = shell.dataset.origPad || "";
+      if (content) content.style.maxWidth = content.dataset.origMax || "";
+    };
+  }, []);
+
+  // ─── STYLE & SIZE STATE ──────────────────────────────────
+  const [selectedStyleId, setSelectedStyleId] = useState(
+    styles.find((s) => s.render_key === "rib_type")?.style_id ?? styles[0]?.style_id ?? null
+  );
+  const [selectedRegion, setSelectedRegion] = useState(null);
+
+  // ─── REGION-SPECIFIC BASE PRICE ────────────────────────────
+  const [regionBasePriceResult, setRegionBasePriceResult] = useState(null);
+  const [roofStyleBasePriceResult, setRoofStyleBasePriceResult] = useState(null);
+  const [legHeightPrice, setLegHeightPrice] = useState(0);
+
+  // ─── ZIP CODE GATE STATE ──────────────────────────────────
+  // The configurator content is locked until a valid US ZIP is confirmed.
+  const [showZipModal, setShowZipModal] = useState(true);
+  const [zipDraft, setZipDraft] = useState("");
+  const [zipError, setZipError] = useState(null);
+  const [zipSubmitting, setZipSubmitting] = useState(false);
+  const [zipCode, setZipCode] = useState(null);
+  const [zipCity, setZipCity] = useState(null);
+  const [zipStateCode, setZipStateCode] = useState(null);
+
+  // The configurator content is locked (no actions) until a zip is confirmed;
+  // the app header/navigation outside the configurator stays usable.
+  const zipUnlocked = zipCode != null;
+  const zipLocked = !zipUnlocked;
+
+  // ─── ADD ZIP CODE FLOW ────────────────────────────────────
+  // Shown when the typed ZIP is missing from metal_s_zip_codes: the user can
+  // add it after confirming the details looked up via lookupZipDetailsAction.
+  const [zipNotFoundDigits, setZipNotFoundDigits] = useState(null);
+  const [showAddZipModal, setShowAddZipModal] = useState(false);
+  const [addZipStep, setAddZipStep] = useState("form"); // "form" | "confirm"
+  const [addZipDraft, setAddZipDraft] = useState(emptyAddZipDraft());
+  const [addZipLookupLoading, setAddZipLookupLoading] = useState(false);
+  const [addZipLookupNote, setAddZipLookupNote] = useState(null);
+  const [addZipError, setAddZipError] = useState(null);
+  const [addZipSaving, setAddZipSaving] = useState(false);
+
+  // ─── SNOW LOAD (metal_s_snowload_data, by delivery ZIP) ───
+  // Looked up whenever a ZIP is accepted. Status:
+  //   "idle" | "loading" | "found" | "missing" | "error"
+  // "missing"/"error" show an Add Snow Load button that opens the pop-up;
+  // saving inserts a row for the ZIP (addSnowLoadForZipCode).
+  const [snowLoad, setSnowLoad] = useState(null);
+  const [snowLoadStatus, setSnowLoadStatus] = useState("idle");
+  const [showSnowLoadModal, setShowSnowLoadModal] = useState(false);
+  const [snowLoadDraft, setSnowLoadDraft] = useState("");
+  const [snowLoadError, setSnowLoadError] = useState(null);
+  const [snowLoadSaving, setSnowLoadSaving] = useState(false);
+  // ZIP of the latest lookup — a slow answer for a ZIP that was changed since
+  // is ignored.
+  const snowLoadZipRef = useRef(null);
+
+  // `quiet` (width-change refresh): keep the current value and skip the
+  // "looking up…" state, so the upcharge/quote don't flash to $0 while the
+  // refresh runs; a failed quiet refresh keeps the last good value.
+  const loadSnowLoadForZip = async (zip, { quiet = false } = {}) => {
+    snowLoadZipRef.current = zip;
+    if (!quiet) {
+      setSnowLoad(null);
+      setSnowLoadStatus("loading");
+    }
+    try {
+      const res = await findSnowLoadByZipCode(zip);
+      if (snowLoadZipRef.current !== zip) return;
+      if (res.ok && res.found) {
+        setSnowLoad(res.snowLoad);
+        setSnowLoadStatus("found");
+      } else {
+        setSnowLoad(null);
+        setSnowLoadStatus("missing");
+      }
+    } catch (err) {
+      console.error("Snow load lookup failed:", err);
+      if (snowLoadZipRef.current === zip && !quiet) setSnowLoadStatus("error");
+    }
+  };
+
+  const openSnowLoadModal = () => {
+    setSnowLoadDraft("");
+    setSnowLoadError(null);
+    setShowSnowLoadModal(true);
+  };
+
+  const closeSnowLoadModal = () => {
+    if (snowLoadSaving) return; // don't dismiss mid-save
+    setShowSnowLoadModal(false);
+  };
+
+  const saveSnowLoad = async (e) => {
+    e?.preventDefault();
+    if (!zipCode) return;
+    const value = Number(snowLoadDraft);
+    if (snowLoadDraft === "" || !Number.isFinite(value) || value < 0) {
+      setSnowLoadError("Please enter a snow load of 0 or more (psf).");
+      return;
+    }
+    setSnowLoadSaving(true);
+    setSnowLoadError(null);
+    try {
+      const res = await addSnowLoadForZipCode(zipCode, value);
+      if (!res.ok) {
+        setSnowLoadError(res.message || "Could not save the snow load. Please try again.");
+        return;
+      }
+      snowLoadZipRef.current = zipCode;
+      setSnowLoad(res.snowLoad);
+      setSnowLoadStatus("found");
+      setShowSnowLoadModal(false);
+    } catch (err) {
+      console.error("Saving snow load failed:", err);
+      setSnowLoadError("Could not save the snow load. Please try again.");
+    } finally {
+      setSnowLoadSaving(false);
+    }
+  };
+
+  // ─── SALES TAX RATE (via free SalesTaxZip API — 100 req/hr) ─
+  const { data: taxData, getTaxRate } = useTaxRate();
+  const [salesTaxRate, setSalesTaxRate] = useState(0.07); // fallback default
+
+  // Parse the combined_pct string (e.g. "8.875%") into a decimal.
+  useEffect(() => {
+    if (taxData?.rates?.combined_pct) {
+      const num = parseFloat(String(taxData.rates.combined_pct).replace("%", ""));
+      if (!isNaN(num)) setSalesTaxRate(num / 100);
+    }
+  }, [taxData]);
+
+  // Shared accept path for a confirmed ZIP (existing row or just-added row):
+  // unlocks the configurator and starts the sales-tax lookup.
+  const acceptZipLookupResult = (result) => {
+    setZipCode(result.zipCode);
+    setZipCity(result.city);
+    setZipStateCode(result.region?.state_code ?? null);
+    setSelectedRegion(result.region ?? null);
+    setShowZipModal(false);
+    setShowAddZipModal(false);
+    setZipNotFoundDigits(null);
+    setZipError(null);
+
+    // Automatically fetch the sales tax rate for this ZIP.
+    getTaxRate(result.zipCode);
+
+    // Look up the snow load for this ZIP (metal_s_snowload_data).
+    loadSnowLoadForZip(result.zipCode);
+  };
+
+  const submitZip = async (e) => {
+    e?.preventDefault();
+    setZipError(null);
+    setZipNotFoundDigits(null);
+    const digits = zipDraft.replace(/\D/g, "").slice(0, 5);
+    if (digits.length !== 5) {
+      setZipError("Please enter a valid 5-digit ZIP code.");
+      return;
+    }
+    setZipSubmitting(true);
+    try {
+      const result = await findRegionByZipCode(digits);
+      if (!result.ok) {
+        if (result.reason === "not_found") {
+          setZipError("The given zip code is not yet part of the serviceable area. You can add your ZIP code below to continue.");
+          setZipNotFoundDigits(digits);
+        } else {
+          setZipError("Please enter a valid 5-digit ZIP code.");
+        }
+        return;
+      }
+      // Accept the ZIP and auto-select the linked region (may be null if
+      // the zip's region is inactive — default pricing applies).
+      acceptZipLookupResult(result);
+    } catch (err) {
+      console.error("ZIP lookup failed:", err);
+      setZipError("Something went wrong looking up that ZIP. Please try again.");
+    } finally {
+      setZipSubmitting(false);
+    }
+  };
+
+  // ─── ZIP GATE CLOSE / REOPEN ──────────────────────────────
+  // The Delivery Location modal can be dismissed, but while no ZIP has
+  // been confirmed the configurator content stays locked (see zipLocked).
+  const closeZipModal = () => {
+    if (zipSubmitting) return; // don't dismiss mid-lookup
+    setShowZipModal(false);
+  };
+
+  // Reopen the Delivery Location modal (locked state and Change ZIP).
+  const reopenZipModal = () => {
+    setZipDraft(zipCode ?? "");
+    setZipError(null);
+    setZipNotFoundDigits(null);
+    setShowZipModal(true);
+  };
+
+  // ─── ADD ZIP CODE FLOW (missing ZIP → lookup → confirm → save) ─
+
+  const closeAddZipModal = () => {
+    if (addZipSaving) return;
+    setShowAddZipModal(false);
+    setAddZipStep("form");
+    setAddZipError(null);
+    setAddZipLookupNote(null);
+  };
+
+  // Track per-field edits so the confirmation step can show what came from
+  // the lookup API vs. manual entry.
+  const updateAddZipField = (field, value) => {
+    setAddZipDraft((prev) => ({
+      ...prev,
+      [field]: value,
+      sources: { ...prev.sources, [field]: "manual" },
+    }));
+  };
+
+  // Open the Add ZIP modal and pre-fill the form from the lookup API.
+  const openAddZipModal = async () => {
+    const digits = String(zipNotFoundDigits ?? zipDraft ?? "").replace(/\D/g, "").slice(0, 5);
+    setAddZipStep("form");
+    setAddZipError(null);
+    setAddZipLookupNote(null);
+    setAddZipDraft({ ...emptyAddZipDraft(), zipCode: digits });
+    setShowAddZipModal(true);
+    if (digits.length !== 5) return;
+
+    setAddZipLookupLoading(true);
+    try {
+      const result = await lookupZipDetailsAction(digits);
+      if (result.ok && result.details) {
+        const d = result.details;
+        setAddZipDraft((prev) => ({
+          ...prev,
+          zipCode: String(d.zipCode ?? digits),
+          region: d.stateName ?? d.region ?? "",
+          stateCode: d.region ?? "",
+          city: d.city ?? "",
+          county: d.county ?? "",
+          latitude: d.latitude ?? "",
+          longitude: d.longitude ?? "",
+          sources: {
+            region: (d.stateName ?? d.region) != null ? "api" : undefined,
+            city: d.city != null ? "api" : undefined,
+            county: d.county != null ? "api" : undefined,
+            latitude: d.latitude != null ? "api" : undefined,
+            longitude: d.longitude != null ? "api" : undefined,
+          },
+        }));
+        // Surface anything the lookup API couldn't provide (e.g. city/county on
+        // the free tier) so the user knows to enter it manually.
+        const missing = ["city", "county"].filter((k) => d[k] == null);
+        if (missing.length > 0) {
+          setAddZipLookupNote(`Not provided by the ZIP lookup: ${missing.join(", ")} — please enter ${missing.length > 1 ? "them" : "it"} manually.`);
+        }
+      } else {
+        setAddZipLookupNote(result.message || "ZIP details lookup unavailable — please fill in the details manually.");
+      }
+    } catch (err) {
+      console.error("ZIP details lookup failed:", err);
+      setAddZipLookupNote("ZIP details lookup unavailable — please fill in the details manually.");
+    } finally {
+      setAddZipLookupLoading(false);
+    }
+  };
+
+  // Step 1 → Step 2: validate, then show the read-only confirmation summary
+  // of the API data result (merged with manual edits) before anything is saved.
+  const reviewAddZip = () => {
+    setAddZipError(null);
+    const digits = String(addZipDraft.zipCode ?? "").replace(/\D/g, "").slice(0, 5);
+    if (digits.length !== 5) {
+      setAddZipError("Please enter a valid 5-digit ZIP code.");
+      return;
+    }
+    if (!String(addZipDraft.region ?? "").trim()) {
+      setAddZipError("Please enter a region (e.g. the state name) so we can price your building.");
+      return;
+    }
+    setAddZipStep("confirm");
+  };
+
+  // Step 2 → save the confirmed ZIP and unlock the configurator.
+  const confirmAddZip = async () => {
+    setAddZipError(null);
+    const digits = String(addZipDraft.zipCode ?? "").replace(/\D/g, "").slice(0, 5);
+    setAddZipSaving(true);
+    try {
+      const result = await addZipCodeAction({
+        zip_code: digits,
+        region: addZipDraft.region || null,
+        state_code: addZipDraft.stateCode || null,
+        city: addZipDraft.city || null,
+        county: addZipDraft.county || null,
+        latitude: addZipDraft.latitude === "" || addZipDraft.latitude == null ? null : Number(addZipDraft.latitude),
+        longitude: addZipDraft.longitude === "" || addZipDraft.longitude == null ? null : Number(addZipDraft.longitude),
+      });
+      if (!result?.ok) {
+        setAddZipError("The ZIP code was saved but could not be loaded. Please try again.");
+        return;
+      }
+      acceptZipLookupResult(result);
+    } catch (err) {
+      console.error("Add ZIP failed:", err);
+      setAddZipError(err?.message || "Something went wrong saving that ZIP code. Please try again.");
+    } finally {
+      setAddZipSaving(false);
+    }
+  };
+
+  const baseFeature = features.find((f) => f.is_required);
+  const baseFeatureId = baseFeature?.feature_id;
+
+  // Helper: get the style row for current selection
+  const selectedStyle = styles.find((s) => s.style_id === selectedStyleId);
+  // Triple Wide resolves to the Garage profile (render_key "garage"); gate the
+  // reference defaults on the style NAME so other garage-style names are not
+  // forced into the 30×30×10 quote.
+  const isTripleWideStyle = String(selectedStyle?.name ?? "").toLowerCase().replace(/\s+/g, " ").trim() === "triple wide";
+  // Profile reference sizes that override the DB style defaults: Triple Wide
+  // (30×30×10) and Loafing Shed (12×30×12). Names kept for the existing callers.
+  const tripleWideSize = (isTripleWideStyle || resolveStyleKey(selectedStyle) === "loafing_shed")
+    ? getStyleProfile(resolveStyleKey(selectedStyle)).defaultSetup?.size
+    : null;
+  const tripleWideWidth = tripleWideSize?.width;
+  const tripleWideLength = tripleWideSize?.length;
+  const tripleWideHeight = tripleWideSize?.height;
+
+  const handleStyleChange = (styleId) => {
+    setSelectedStyleId(styleId);
+  };
+
+  // Dimension values for current style. The style's metal_s_style defaults are
+  // merged into the offered lists so the SIZE selectors can always display the
+  // applied default size.
+  const widths = useMemo(() => mergeDimValue(mergeDimValue(getUniqueDimensionValues(matrixPrices, baseFeatureId, selectedStyleId, "width"), selectedStyle?.default_width), tripleWideWidth), [matrixPrices, baseFeatureId, selectedStyleId, selectedStyle, tripleWideWidth]);
+  const lengths = useMemo(() => mergeDimValue(mergeDimValue(getUniqueDimensionValues(matrixPrices, baseFeatureId, selectedStyleId, "length"), selectedStyle?.default_length), tripleWideLength), [matrixPrices, baseFeatureId, selectedStyleId, selectedStyle, tripleWideLength]);
+  const heights = useMemo(() => mergeDimValue(mergeDimValue(getLegHeightValues(legHeightPrices, baseFeatureId, selectedStyleId), selectedStyle?.default_height), tripleWideHeight), [legHeightPrices, baseFeatureId, selectedStyleId, selectedStyle, tripleWideHeight]);
+
+  // Default size comes from metal_s_style.default_width/default_length/
+  // default_height for the initially selected style (never hard-coded).
+  const initStyle = styles.find((s) => s.render_key === "rib_type") ?? styles[0];
+  const [width, setWidth] = useState(() => resolveStyleDefaultDim(initStyle?.default_width, widths, 12));
+  const [length, setLength] = useState(() => resolveStyleDefaultDim(initStyle?.default_length, lengths, 20));
+  const [height, setHeight] = useState(() => resolveStyleDefaultDim(initStyle?.default_height, heights, 6));
+
+  // ─── FREE STANDING LEAN TO — Back/Front eave heights ─────
+  // This style is a mono-slope shelter with two eave heights: the Back (tall)
+  // eave is the regular Leg Height (`height`); the Front (short) eave gets its
+  // own selector below (UI + preview only — pricing is a later step).
+  const isFreeStandingLeanto = resolveStyleKey(selectedStyle) === "free_standing_lean_to";
+
+  // ─── LOAFING SHED — Roof Extension ─────────────────────────
+  // Roof Extension is only offered on Loafing Shed buildings.
+  const isLoafingShed =
+    String(resolveStyleKey(selectedStyle)).toLowerCase().includes("loafing") ||
+    String(selectedStyle?.name ?? "").toLowerCase().includes("loafing");
+  // Open covered area beyond the enclosed back end carried by outer posts.
+  // Defaults to "Roof Extension" per the reference order look.
+  const [roofExtensionSelection, setRoofExtensionSelection] = useState("Roof Extension");
+  const roofExtensionFt = isLoafingShed && roofExtensionSelection === "Roof Extension"
+    ? getStyleProfile(resolveStyleKey(selectedStyle))?.rendering?.roofExtensionFt ?? 10
+    : 0;
+  // Loafing Shed low eave (reference Leg Height "12'x9'"): Leg Height minus
+  // width × the profile's fixed mono-slope (3/12), rounded, never below 4′.
+  // Passed to the 3D as frontHeight so the labels and the render agree.
+  const loafingLowEave = isLoafingShed
+    ? Math.max(4, Math.round(height - width * (getStyleProfile(resolveStyleKey(selectedStyle))?.rendering?.monoSlopePitch ?? 0.25)))
+    : null;
+  // Leg Height dropdown label: "12'" — or for the Loafing Shed "12'x9'", each
+  // option showing its own low side (same rule as loafingLowEave).
+  const legHeightLabel = (v) => (isLoafingShed
+    ? `${v}'x${Math.max(4, Math.round(v - width * (getStyleProfile(resolveStyleKey(selectedStyle))?.rendering?.monoSlopePitch ?? 0.25)))}'`
+    : `${v}'`);
+
+  // ─── SNOW LOAD UPCHARGE RATE (metal_s_snowload_rate) ───────
+  // Looked up again whenever the Width or the ZIP's snow load changes:
+  // width range + highest snow_load tier <= the ZIP's snow load (55 → the
+  // 50 PSF row; below the lowest tier → none). null = no ZIP snow load, no
+  // matching tier, or the lookup failed. Drives
+  // snowLoadUpcharge (added to the totals and the estimate).
+  const [snowLoadRate, setSnowLoadRate] = useState(null);
+  useEffect(() => {
+    let cancelled = false;
+    if (!width || snowLoad == null) {
+      setSnowLoadRate(null);
+      return;
+    }
+    (async () => {
+      try {
+        const res = await findSnowLoadRateByWidth(width, snowLoad);
+        if (!cancelled) setSnowLoadRate(res.ok && res.found ? res : null);
+      } catch (err) {
+        console.error("Snow load rate lookup failed:", err);
+        if (!cancelled) setSnowLoadRate(null);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [width, snowLoad]);
+
+  // Width field: every change re-checks the ZIP's snow load (quiet refresh).
+  // The snow load rate lookup then re-runs through the effect above (keyed
+  // on [width, snowLoad]), and the quote follows: snowLoadUpcharge →
+  // subtotal / grandTotal → estimate are all memos of those values.
+  const handleWidthChange = (value) => {
+    setWidth(value);
+    if (zipCode) loadSnowLoadForZip(zipCode, { quiet: true });
+  };
+  // Snap the Front eave onto the offered height list, strictly below the Back.
+  const snapFrontHeight = useCallback((desired, backH) => {
+    const opts = heights.filter((v) => v < backH);
+    if (!opts.length) return Math.max(1, backH - 2);
+    return opts.reduce((best, v) => (Math.abs(v - desired) < Math.abs(best - desired) ? v : best), opts[0]);
+  }, [heights]);
+  const [frontHeight, setFrontHeight] = useState(() => Math.max(4, height - 2));
+  // Front eave must stay strictly below the Back eave (derive-safe).
+  const frontHeightOptions = useMemo(() => heights.filter((v) => v < height), [heights, height]);
+  const effFrontHeight = useMemo(
+    () => (frontHeightOptions.includes(frontHeight) ? frontHeight : snapFrontHeight(Math.max(1, height - 2), height)),
+    [frontHeightOptions, frontHeight, snapFrontHeight, height]
+  );
+
+  // ─── STYLE-DRIVEN OPTIONS STATE ──────────────────────────
+  const DEFAULT_ROOFING = "Vertical";
+  const DEFAULT_ROOF_OVERHANG = '6"';
+
+  const [roofing, setRoofing] = useState(DEFAULT_ROOFING);
+  // Pitch choices and their multiplier factors are DB-driven
+  // (metal_s_feature_option) — default to the first option by sort_order
+  // rather than a hardcoded pitch.
+  const [roofPitch, setRoofPitch] = useState(() => getRoofPitchOptionNames(features, options)[0] ?? "");
+  // Default overhang comes from metal_s_style.default_roof_overhang, matched
+  // against the roof-overhang option labels (never hard-coded per style).
+  const [roofOverhang, setRoofOverhang] = useState(
+    () => buildDefaultRoofOverhangAddOn(features, options, selectedStyle)?.description ?? DEFAULT_ROOF_OVERHANG
+  );
+  // Gutters UI selections — drive Rain Gutters visibility and gutter pricing.
+  const [guttersSelection, setGuttersSelection] = useState("No Gutters");
+  const [rainGuttersSelection, setRainGuttersSelection] = useState(DEFAULT_RAIN_GUTTERS);
+  // J-Trim UI selection (Sides & Ends tab) — UI state only, not wired to pricing.
+  const [jTrimSelection, setJTrimSelection] = useState("Add J-Trim (Sides)");
+  // Downspout count (0-10) — legacy input for the rate-based
+  // calculateGutterPricing call. The "Number of Downspouts" UI field below
+  // (uiDownspoutCount) drives the actual downspout price via
+  // computeDownspoutPrice.
+  const [downspoutCount, setDownspoutCount] = useState(0);
+  // Number of Downspouts UI field (0-10) — drives the downspout price
+  // (computeDownspoutPrice) and the estimate. Default is side-based for the
+  // Standard (Regular) Carport (Both Sides → 4, one side → 2) and 0 for every
+  // other style — see getDefaultDownspoutCount.
+  const [uiDownspoutCount, setUiDownspoutCount] = useState(() => getDefaultDownspoutCount(selectedStyle, rainGuttersSelection));
+  // Multiplier factor looked up from metal_s_feature_option for the selected
+  // overhang (e.g. 0.15 → upcharge = Base Structure Price × 0.15). 0 = no upcharge.
+  const [roofOverhangMultiplier, setRoofOverhangMultiplier] = useState(0);
+  // Multiplier factor looked up from metal_s_feature_option for the selected
+  // roof pitch — upcharge = (W × H × L) × factor. 0 = no matching DB row.
+  const [roofPitchMultiplier, setRoofPitchMultiplier] = useState(0);
+
+  // Reset style-driven options to defaults whenever building style changes
+  useEffect(() => {
+    setRoofing(DEFAULT_ROOFING);
+    // Loafing Shed: Roof Pitch is hidden — keep it on the profile's fixed
+    // pitch (3/12) so the estimate/pricing never use a hidden default.
+    const fixedRoofPitch = resolveStyleKey(selectedStyle) === "loafing_shed"
+      ? getStyleProfile("loafing_shed").structureDefaults?.roofPitch ?? null
+      : null;
+    setRoofPitch(fixedRoofPitch ?? getRoofPitchOptionNames(features, options)[0] ?? "");
+    setRoofOverhang(buildDefaultRoofOverhangAddOn(features, options, selectedStyle)?.description ?? DEFAULT_ROOF_OVERHANG);
+    setRoofOverhangMultiplier(0);
+    setRoofPitchMultiplier(0);
+    setGuttersSelection("No Gutters");
+    setRainGuttersSelection(DEFAULT_RAIN_GUTTERS);
+    setDownspoutCount(0);
+    // Side is reset to the default above, so seed its matching downspout default.
+    setUiDownspoutCount(getDefaultDownspoutCount(selectedStyle, DEFAULT_RAIN_GUTTERS));
+  }, [selectedStyleId, features, options, selectedStyle]);
+
+  // ─── Fetch roof-style base price ───────────────────────────
+  // Re-run when roofing, dimensions, or region change
+  useEffect(() => {
+    let cancelled = false;
+    if (!selectedRegion || !roofing || !width || !length) {
+      setRoofStyleBasePriceResult(null);
+      return;
+    }
+    (async () => {
+      try {
+        const result = await lookupRoofStyleBasePrice({
+          roofStyle: roofing,
+          width,
+          length,
+          regionId: selectedRegion.region_id,
+        });
+        if (!cancelled) setRoofStyleBasePriceResult(result);
+      } catch (err) {
+        if (!cancelled) setRoofStyleBasePriceResult(null);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [roofing, width, length, selectedRegion]);
+
+  // ─── Fetch leg-height price ────────────────────────────────
+  // Re-run when region, style, or dimensions change.
+  // Falls back to the client-side matrix lookup if the server view returns
+  // no price (so changing length still works while the Supabase view is
+  // being verified).
+  useEffect(() => {
+    let cancelled = false;
+    if (!selectedRegion || !selectedStyleId || height == null || !baseFeatureId) {
+      setLegHeightPrice(0);
+      return;
+    }
+    (async () => {
+      try {
+        const result = await lookupLegHeightPrice({
+          regionId: selectedRegion.region_id,
+          length,
+          legHeight: height,
+        });
+        // Diagnostics: make it easy to see what the server returned.
+        // eslint-disable-next-line no-console
+        console.log("[legHeight] server result", {
+          regionId: selectedRegion.region_id,
+          length,
+          legHeight: height,
+          result,
+        });
+        const serverPrice = result?.leg_price ?? 0;
+        if (!cancelled) {
+          if (serverPrice > 0) {
+            setLegHeightPrice(serverPrice);
+          } else {
+            // Fallback to client-side matrix data so length changes still work
+            // immediately while the public.metal_vw_leg_price_lookup view is
+            // being sorted out.
+            const fallback = lookupLegHeightPriceClient(
+              legHeightPrices,
+              matrixPrices,
+              baseFeatureId,
+              selectedStyleId,
+              width,
+              length,
+              height
+            );
+            // eslint-disable-next-line no-console
+            console.log("[legHeight] fallback price", { fallback });
+            setLegHeightPrice(fallback ?? 0);
+          }
+        }
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error("[legHeight] server lookup failed", err);
+        if (!cancelled) {
+          const fallback = lookupLegHeightPriceClient(
+            legHeightPrices,
+            matrixPrices,
+            baseFeatureId,
+            selectedStyleId,
+            width,
+            length,
+            height
+          );
+          setLegHeightPrice(fallback ?? 0);
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [selectedRegion, selectedStyleId, width, length, height, baseFeatureId, legHeightPrices, matrixPrices]);
+
+  const [wallMode, setWallMode] = useState(() => getDefaultWallMode(initStyle));
+
+  const panelFeature = features.find((f) => f.pricing_type === "PANEL");
+  const [wallSelections, setWallSelections] = useState({});
+
+  // Walls the user explicitly changed (drawer shows selected-only rows)
+  const [touchedWallIds, setTouchedWallIds] = useState(() => new Set());
+  const markWallsTouched = useCallback((ids) => {
+    setTouchedWallIds((prev) => {
+      const next = new Set(prev);
+      ids.forEach((id) => next.add(id));
+      return next;
+    });
+  }, []);
+  // Step Down Barn: the center front renders gable-only by default (open
+  // porch). Cleared when the user picks a wall mode or edits a wall.
+  const [frontGableDefault, setFrontGableDefault] = useState(() => resolveStyleKey(initStyle) === "step_down_barn");
+  const changeWallSelection = useCallback((locationId, optionId) => {
+    setFrontGableDefault(false);
+    // Preserve the empty "Open (No Panel)" selection as ""; otherwise store the
+    // numeric id (a metal_s_panel_option.option_id or metal_m_panel_pricing.panel_pricing_id).
+    setWallSelections((prev) => ({ ...prev, [locationId]: optionId === "" ? "" : Number(optionId) }));
+    markWallsTouched([locationId]);
+  }, [markWallsTouched]);
+
+  // ─── PANEL STATE ─────────────────────────────────────────
+
+  // Siding direction
+  const sidingFeature = features.find((f) => f.render_key === "siding_panel");
+  const sidingOptions = useMemo(() => (sidingFeature ? options.filter((o) => o.feature_id === sidingFeature.feature_id) : []), [sidingFeature, options]);
+  const [sidingOptionId, setSidingOptionId] = useState(null);
+
+  // ─── ADD-ONS STATE ───────────────────────────────────────
+  const [addOnItems, setAddOnItems] = useState(() => {
+    const initial = {};
+    // Default installation surface to "Concrete" on first load
+    const surfaceDefault = buildInstallationSurfaceDefault(features, options);
+    if (surfaceDefault) initial[surfaceDefault.featureId] = surfaceDefault;
+    // Default Frame Gauge to the 14 gauge framing on first load
+    const gaugeDefault = buildDefaultFrameGaugeAddOn(features, framings);
+    if (gaugeDefault) initial[gaugeDefault.featureId] = gaugeDefault;
+    // Default Panel Upgrade to the no-charge Standard 29ga Panel on first load
+    const panelUpgradeDefault = buildPanelUpgradeDefault(features, options);
+    if (panelUpgradeDefault) initial[panelUpgradeDefault.featureId] = panelUpgradeDefault;
+    // Triple Wide: apply the profile defaultSetup.addons (Trusses + Engineer
+    // Certified) on first load.
+    if (isTripleWideStyle) {
+      Object.assign(initial, resolveDefaultAddOns(features, options, getStyleProfile(resolveStyleKey(selectedStyle)).defaultSetup?.addons));
+    }
+    return initial;
+  });
+
+  // ─── PANEL UPGRADE SCOPE ──────────────────────────────────
+  // "Roof Only" | "All Paneling" — shown under Panel Upgrade only when a
+  // non-standard (paid) panel is selected; listed in the estimate. No price.
+  const PANEL_UPGRADE_SCOPES = ["Roof Only", "All Paneling"];
+  const [panelUpgradeScope, setPanelUpgradeScope] = useState("Roof Only");
+  const panelUpgradeStd = buildPanelUpgradeDefault(features, options);
+  const panelUpgradeItem = panelUpgradeStd ? addOnItems[panelUpgradeStd.featureId] : null;
+  const showPanelUpgradeScope = !!panelUpgradeItem && panelUpgradeItem.description !== panelUpgradeStd.description;
+
+  // ─── INSULATION AREAS (state) ─────────────────────────────
+  // Checked "where to insulate" areas: { "<section>:<area>": true }
+  // (section = "center" or a lean-to side_key; area = "roof" or a wall key).
+  const [insulationAreas, setInsulationAreas] = useState({});
+
+  // Initialize add-ons from style defaults when style changes
+  const [prevStyleForDefaults, setPrevStyleForDefaults] = useState(selectedStyleId);
+  if (prevStyleForDefaults !== selectedStyleId) {
+    setPrevStyleForDefaults(selectedStyleId);
+    // Build addOnItems from styleDefaults for the current style
+    const newAddOns = {};
+    const currentDefaults = (styleDefaults ?? []).filter((d) => d.style_id === selectedStyleId);
+    for (const def of currentDefaults) {
+      const feat = features.find((f) => f.feature_id === def.feature_id);
+      if (!feat) continue;
+      const opt = options.find((o) => o.option_id === def.option_id);
+      if (!opt) continue;
+      newAddOns[def.feature_id] = {
+        featureId: def.feature_id,
+        featureName: feat.name,
+        description: opt.name,
+        price: Number(opt.price),
+      };
+    }
+    // Triple Wide: merge the profile defaultSetup.addons (Trusses + Engineer
+    // Certified) into the DB style defaults.
+    if (isTripleWideStyle) {
+      Object.assign(newAddOns, resolveDefaultAddOns(features, options, getStyleProfile(resolveStyleKey(selectedStyle)).defaultSetup?.addons));
+    }
+    // Default installation surface to "Concrete" whenever defaults are reset
+    const surfaceDefault = buildInstallationSurfaceDefault(features, options);
+    if (surfaceDefault) newAddOns[surfaceDefault.featureId] = surfaceDefault;
+    // Default Frame Gauge to the 14 gauge framing whenever defaults are reset
+    const gaugeDefault = buildDefaultFrameGaugeAddOn(features, framings);
+    if (gaugeDefault) newAddOns[gaugeDefault.featureId] = gaugeDefault;
+    // Default Panel Upgrade to the no-charge Standard 29ga Panel on reset
+    const panelUpgradeDefault = buildPanelUpgradeDefault(features, options);
+    if (panelUpgradeDefault) newAddOns[panelUpgradeDefault.featureId] = panelUpgradeDefault;
+    setPanelUpgradeScope("Roof Only");
+    setInsulationAreas({});
+    // Concrete surface requires no anchor package — drop any seeded anchor package
+    // so it is never counted in the estimate.
+    const seededAnchorFeat = features.find((f) => f.name === "Anchor Package" || f.render_key === "anchor_package");
+    if (seededAnchorFeat && surfaceDefault?.description === DEFAULT_INSTALLATION_SURFACE) {
+      delete newAddOns[seededAnchorFeat.feature_id];
+    }
+    setAddOnItems(newAddOns);
+  }
+
+  // ─── SELECTED FRAMING GAUGE ───────────────────────────────
+  // The Frame Gauge add-on (FramingSelector) stores the metal_s_framing
+  // framing_name in addOnItems; resolve it back to the framing id so the
+  // base structure price lookup can prefer that gauge's matrix row.
+  const selectedFramingId = useMemo(() => {
+    const feat = features.find((f) => isFrameGaugeFeature(f));
+    return resolveFramingId(framings, feat ? addOnItems[feat.feature_id]?.description : null);
+  }, [features, addOnItems, framings]);
+
+  // ─── BASE STRUCTURE PRICE LOOKUP ──────────────────────────
+  // Shared fetch used by both the explicit Framing Gauge event below and the
+  // effect that reacts to style/region/size/gauge changes. A request-id guard
+  // ensures a stale response can never overwrite a newer one (e.g. switching
+  // gauges quickly).
+  const basePriceReqRef = useRef(0);
+  const fetchRegionBasePrice = useCallback(async (framingId) => {
+    if (!selectedRegion || !baseFeatureId || !selectedStyleId) {
+      setRegionBasePriceResult(null);
+      return;
+    }
+    const reqId = ++basePriceReqRef.current;
+    try {
+      const result = await lookupRegionBasePrice({
+        featureId: baseFeatureId,
+        regionId: selectedRegion.region_id,
+        styleId: selectedStyleId,
+        width,
+        length,
+        framingId,
+      });
+      if (reqId === basePriceReqRef.current) setRegionBasePriceResult(result);
+    } catch (err) {
+      if (reqId === basePriceReqRef.current) setRegionBasePriceResult(null);
+    }
+  }, [selectedRegion, baseFeatureId, selectedStyleId, width, length]);
+
+  // ─── FRAMING GAUGE EVENT ─────────────────────────────────
+  // Explicit event wiring: selecting a gauge immediately triggers the base
+  // structure price lookup for the newly selected framing gauge.
+  const handleFrameGaugeChange = useCallback((item) => {
+    fetchRegionBasePrice(item ? resolveFramingId(framings, item.description) : null);
+  }, [fetchRegionBasePrice, framings]);
+
+  // ─── Fetch region-specific base price ─────────────────────
+  // Re-run when style, region, dimensions, or framing gauge change. The
+  // framing gauge is part of the lookup so the base structure price follows
+  // the selected gauge (metal_m_feature_matrix_price.framing).
+  useEffect(() => {
+    fetchRegionBasePrice(selectedFramingId);
+  }, [fetchRegionBasePrice, selectedFramingId]);
+
+  // ─── DOORS & WINDOWS STATE ───────────────────────────────
+  // The Doors & Windows feature: a PER_ITEM feature in a door/window category.
+  // Other PER_ITEM features (e.g. "Backets" under Materials) must not be picked,
+  // or their whole category is hidden from the Materials tab (see filteredOtherFeatures).
+  const doorWindowFeature = features.find(
+    (f) => f.pricing_type === "PER_ITEM" && /door|window/i.test(String(f.category ?? ""))
+  );
+  // Seeded from the style profile's defaultSetup openings (e.g. Garage:
+  // front 10×10 roll-up + left prehung door and window); styles without
+  // a defaultSetup start with empty walls.
+  const [doorWindowSelections, setDoorWindowSelections] = useState(() =>
+    resolveDefaultOpenings(doorWindowItems, getStyleProfile(resolveStyleKey(selectedStyle)).defaultSetup?.openings)
+  );
+
+  // ─── COLORS STATE ────────────────────────────────────────
+  const colorFeature = features.find((f) => f.pricing_type === "COLOR");
+  const [colorSelections, setColorSelections] = useState(() =>
+    resolveDefaultColorSelections(
+      colorGroups,
+      colorOptions,
+      getStyleProfile(resolveStyleKey(selectedStyle)).defaultSetup?.colors
+    )
+  );
+
+  // ─── LEAN-TO STATE ───────────────────────────────────────
+  const [leantos, setLeantos] = useState([]);
+
+  // Lean-to feature UI selections (display only — not wired to pricing/3D yet)
+  const [leantoUiOptions, setLeantoUiOptions] = useState({});
+  const updateLtUi = useCallback((sideKey, patch) => {
+    setLeantoUiOptions((prev) => ({ ...prev, [sideKey]: { ...(prev[sideKey] ?? LT_UI_DEFAULTS), ...patch } }));
+  }, []);
+
+  // Lean-to card collapse state (UI only — keyed by side_key; missing entry = expanded)
+  const [collapsedLeantos, setCollapsedLeantos] = useState({});
+  // Collapsing the lean-to being configured = "done": back to the Center
+  // section, which ends the 3D focus so the camera returns to the default view.
+  const toggleLeantoCollapsed = useCallback((sideKey) => {
+    const collapsing = !collapsedLeantos[sideKey];
+    setCollapsedLeantos((prev) => ({ ...prev, [sideKey]: collapsing }));
+    if (collapsing) setActiveSection((cur) => (cur === sideKey ? "center" : cur));
+  }, [collapsedLeantos]);
+
+  // ─── STORAGE STATE (Center Storage — UI only, not wired to pricing/3D yet) ──
+  const [storageAdded, setStorageAdded] = useState(false);
+  const [storageLocation, setStorageLocation] = useState("none");
+  const [storageCollapsed, setStorageCollapsed] = useState(false);
+  const [storageDepth, setStorageDepth] = useState(9);
+  const [storageOpenings, setStorageOpenings] = useState(() => ({ ...EMPTY_STORAGE_OPENINGS }));
+  // Center Storage preview config -- geometry plus its inner-wall openings.
+  const storageConfig = useMemo(
+    () => (storageAdded && storageLocation !== "none" ? { location: storageLocation, depthFt: storageDepth, openings: storageOpenings } : null),
+    [storageAdded, storageLocation, storageDepth, storageOpenings]
+  ); // default 9' per the mockup
+
+  const compatibleLeantoStyleIds = useMemo(() => {
+    return [...new Set((leantoCompat ?? []).filter((c) => c.style_id === selectedStyleId).map((c) => c.leanto_style_id))];
+  }, [leantoCompat, selectedStyleId]);
+  const availableLeantoStyles = useMemo(() => {
+    const seenNames = new Set();
+    return (leantoStyles ?? []).filter((s) => {
+      if (!compatibleLeantoStyleIds.includes(s.leanto_style_id)) return false;
+      if (seenNames.has(s.name)) return false;
+      seenNames.add(s.name);
+      return true;
+    });
+  }, [leantoStyles, compatibleLeantoStyleIds]);
+
+  // Lean-to pricing matrix rows — metal_m_feature_matrix_price rows for the
+  // "Attached Lean To" feature (the same rows that drive the lean-to base
+  // price lookup). Source of truth for the lean-to Width/Length options.
+  const leantoMatrixPrices = useMemo(() => {
+    const leantoFeature = findLeantoFeature(features);
+    if (!leantoFeature) return [];
+    return (matrixPrices ?? []).filter((p) => p.feature_id === leantoFeature.feature_id);
+  }, [features, matrixPrices]);
+
+  const getLeantoWidths = useCallback(() => {
+    // Distinct Width values from the "Attached Lean To" pricing matrix
+    // (metal_m_feature_matrix_price). Built-in defaults only when the matrix
+    // has no rows at all — metal_m_leanto_price is never consulted.
+    const fromFeatureMatrix = [...new Set(leantoMatrixPrices
+      .filter((p) => p.width != null)
+      .map((p) => Number(p.width)))].sort((a, b) => a - b);
+    return fromFeatureMatrix.length > 0 ? fromFeatureMatrix : FALLBACK_LT_WIDTHS;
+  }, [leantoMatrixPrices]);
+
+  // Lean-to Length options — distinct Length values from the "Attached Lean
+  // To" pricing matrix; built-in defaults only when the matrix has no rows.
+  const getLeantoLengths = useCallback(() => {
+    const fromFeatureMatrix = [...new Set(leantoMatrixPrices
+      .filter((p) => p.length != null)
+      .map((p) => Number(p.length)))].sort((a, b) => a - b);
+    return fromFeatureMatrix.length > 0 ? fromFeatureMatrix : FALLBACK_LT_LENGTHS;
+  }, [leantoMatrixPrices]);
+
+  // Lean-to Leg Height options — distinct height values from the "Attached
+  // Lean To" pricing matrix; built-in defaults only when the matrix has no
+  // rows. metal_m_leanto_price is never consulted.
+  const getLeantoHeights = useCallback(() => {
+    const fromFeatureMatrix = [...new Set(leantoMatrixPrices
+      .filter((p) => p.height != null)
+      .map((p) => Number(p.height)))].sort((a, b) => a - b);
+    return fromFeatureMatrix.length > 0 ? fromFeatureMatrix : FALLBACK_LT_HEIGHTS;
+  }, [leantoMatrixPrices]);
+
+  // ─── IDEAROOM-STYLE: SECTION / WALL / MODE ───────────────
+  // "section" = center (main building) or a lean-to side
+  const [activeSection, setActiveSection] = useState("center");
+  const [activeWall, setActiveWall] = useState("right");
+  // Selected opening in the 3D preview ({ wall, idx } into
+  // doorWindowSelections) — drives the dimension callouts and syncs with the
+  // "Items on wall" list.
+  const [selectedOpening, setSelectedOpening] = useState(null);
+  const [rightPanelMode, setRightPanelMode] = useState("building");
+  const [editingItemIdx, setEditingItemIdx] = useState(null);
+  const [constraintWarning, setConstraintWarning] = useState(null);
+  const [leantoFocusTick, setLeantoFocusTick] = useState(0);
+
+  // Reset editing and warnings when wall/section changes
+  const [prevWallSection, setPrevWallSection] = useState(`${activeSection}|${activeWall}`);
+  const currentWallSection = `${activeSection}|${activeWall}`;
+  if (prevWallSection !== currentWallSection) {
+    setPrevWallSection(currentWallSection);
+    setEditingItemIdx(null);
+    setConstraintWarning(null);
+    setSelectedOpening(null);
+  }
+
+  // Change section and reset wall to a sensible default
+  const changeSection = useCallback((sectionKey) => {
+    setActiveSection(sectionKey);
+    setActiveWall(sectionKey === "center" ? "right" : sectionKey === "storage" ? "inner" : "outer");
+  }, []);
+
+  const handlePreviewWallSelect = useCallback(({ section, wall }) => {
+    setRightPanelMode("openings");
+    setActiveSection(section);
+    setActiveWall(wall);
+    setSelectedOpening(null);
+    setLeantoFocusTick((tick) => tick + 1);
+  }, []);
+
+  // ─── SIDES & ENDS: wall mode presets ─────────────────────
+  // Plain function (only used in onClick handlers; no memoization needed).
+  const applyMode = (mode) => {
+    setWallMode(mode);
+    setFrontGableDefault(false);
+    if (!panelFeature) return;
+    if (mode === "custom") {
+      // Custom selections are panel_pricing_ids; clear any stale option_ids from
+      // a previous preset mode so they can't collide with panel_pricing_ids.
+      setWallSelections({});
+      markWallsTouched([]);
+      return;
+    }
+    const newSelections = {};
+    for (const loc of panelLocations) {
+      let targetType = "open";
+      if (mode === "enclosed") targetType = "enclosed";
+      else if (mode === "gable") targetType = loc.location_type === "end" ? "gable" : "open";
+      const opt = panelOptions.find(
+        (o) => o.feature_id === panelFeature.feature_id && o.location_type === loc.location_type && o.render_type === targetType
+      );
+      if (opt) newSelections[loc.location_id] = opt.option_id;
+    }
+    markWallsTouched(Object.keys(newSelections));
+    setWallSelections(newSelections);
+  };
+
+  // ─── FEATURE CATEGORIES (Roofing, Concrete, etc.) ────────
+  const otherFeatures = useMemo(() => features.filter((f) => !f.is_required && !["PANEL", "PER_ITEM", "COLOR"].includes(f.pricing_type) && f.render_key !== "siding_panel"), [features]);
+  const currentStyleKey = styles.find((s) => s.style_id === selectedStyleId)?.render_key ?? "regular";
+  const styleProfile = useMemo(() => getStyleProfile(currentStyleKey), [currentStyleKey]);
+  const filteredOtherFeatures = useMemo(() => {
+    const dwCatId = doorWindowFeature?.category_id;
+    let filtered = dwCatId ? otherFeatures.filter((f) => f.category_id !== dwCatId) : otherFeatures;
+    filtered = filtered.filter((f) => isFeatureAllowed(styleProfile, f.render_key));
+    // Exclude roof_pitch and roof_overhang — they live in the Style tab now
+    // Exclude installation_surface — it lives in the Style tab under Building Style
+    // Exclude doors & windows category — they have their own tab
+    // Exclude Roofing category — no longer shown under the Materials tab
+    // Exclude gutter/downspout features — configured via the Style tab's Gutters section
+    filtered = filtered.filter((f) => f.render_key !== "roof_pitch" && f.render_key !== "roof_overhang" && f.name !== "Installation Surface" && f.render_key !== "installation_surface");
+    filtered = filtered.filter((f) => {
+      const cat = (f.category_name || f.category || "").toLowerCase();
+      // DB data varies ("Gutter", "Gutter System"; render_key often null), so
+      // match name/render_key/category with a normalized substring, same as
+      // the gutterFeature lookup used for pricing below.
+      const name = String(f.name ?? "").toLowerCase().replace(/[-\s]/g, "_");
+      const key = String(f.render_key ?? "").toLowerCase().replace(/[-\s]/g, "_");
+      const isGutterRelated =
+        name.includes("gutter") || key.includes("gutter") || cat.includes("gutter") ||
+        name.includes("downspout") || key.includes("downspout") || cat.includes("downspout");
+      return !cat.includes("door") && !cat.includes("window") && !cat.includes("roofing") && !isGutterRelated;
+    });
+    return filtered;
+  }, [otherFeatures, doorWindowFeature, styleProfile]);
+  // Only features FeatureSelector can actually render: RATE / FIXED / PER_WALL
+  // selectors plus the Frame Gauge framing list. MATRIX features (e.g.
+  // "Attached Lean", "Base Structure Leg") render nothing — exclude them so
+  // they don't leave a floating section separator in the Materials tab.
+  // Also hidden from the Materials tab (exact feature name, case/space-
+  // insensitive): "Panel"/"Panels" (walls are set in Sides & Ends), "Snow
+  // Load" (priced automatically from the delivery ZIP + width) and "Other
+  // Fees" (shown in the Others tab — otherFeesFeatures below).
+  // "Truss Bow" has its own Commercial-only Extra Bows section (below).
+  const HIDDEN_MATERIAL_FEATURES = new Set(["panel", "panels", "snow load", "other fees", "truss bow", "foam enclosure", "foam enclosure package"]);
+  const materialSectionFeatures = useMemo(
+    () => {
+      const list = filteredOtherFeatures.filter((f) =>
+        !HIDDEN_MATERIAL_FEATURES.has(String(f.name ?? "").trim().toLowerCase().replace(/\s+/g, " ")) &&
+        (isFrameGaugeFeature(f) || ["RATE", "FIXED", "PER_WALL"].includes(f.pricing_type)));
+      // Panel Upgrade is always listed (first), even when its category is one
+      // the Materials filters above skip.
+      const panelUpgrade = otherFeatures.find((f) => isPanelUpgradeFeature(f) && f.pricing_type === "FIXED");
+      return panelUpgrade && !list.some((f) => f.feature_id === panelUpgrade.feature_id)
+        ? [panelUpgrade, ...list]
+        : list;
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- HIDDEN_MATERIAL_FEATURES is a fixed list
+    [filteredOtherFeatures, otherFeatures]
+  );
+  // ─── BRACKETS (Per Item, Materials) ──────────────────────
+  // Items are metal_s_door_window_item rows of the "Brackets" feature (DB name
+  // may be "Backets"). Price per item name: a row mapped to the delivery region
+  // wins; otherwise a row with no region mapping (default for all regions).
+  // Rows mapped only to other regions are skipped. Shaped as option rows for
+  // QuantityMultiSelector; option_id is name-based so a checked box survives a
+  // region change.
+  const bracketFeature = useMemo(() => features.find((f) => {
+    const n = String(f.name ?? "").trim().toLowerCase();
+    return f.pricing_type === "PER_ITEM" && (n === "brackets" || n === "bracket" || n === "backets");
+  }) ?? null, [features]);
+  const bracketOptions = useMemo(() => resolveRegionPricedOptions({
+    items: legacyDoorWindowItems,
+    featureId: bracketFeature?.feature_id ?? null,
+    regionId: selectedRegion?.region_id ?? null,
+    regionDoorWindow,
+    idPrefix: "br",
+  }), [bracketFeature, legacyDoorWindowItems, regionDoorWindow, selectedRegion]);
+
+  // ─── ANCHORS (Per Item, Materials) ───────────────────────
+  // Same region rule as Brackets, plus the item must match the selected
+  // Installation Surface: item_type === surface code (e.g. "asphalt"), or the
+  // item name contains the surface name. ("Anchor Package" is the separate,
+  // auto size-priced FIXED feature — not matched here.)
+  const anchorFeature = useMemo(() => features.find((f) => {
+    const n = String(f.name ?? "").trim().toLowerCase();
+    return f.pricing_type === "PER_ITEM" && (n === "anchors" || n === "anchor");
+  }) ?? null, [features]);
+  const installationSurfaceName = useMemo(() => {
+    const sf = features.find((f) => f.name === "Installation Surface" || f.render_key === "installation_surface");
+    return (sf ? addOnItems[sf.feature_id]?.description : null) ?? DEFAULT_INSTALLATION_SURFACE;
+  }, [features, addOnItems]);
+  const anchorOptions = useMemo(() => {
+    const code = surfaceTypeCode(installationSurfaceName);
+    const word = String(installationSurfaceName ?? "").trim().toLowerCase();
+    return resolveRegionPricedOptions({
+      items: legacyDoorWindowItems,
+      featureId: anchorFeature?.feature_id ?? null,
+      regionId: selectedRegion?.region_id ?? null,
+      regionDoorWindow,
+      idPrefix: "an",
+      filter: (it) => {
+        if (!code) return false;
+        if (String(it.item_type ?? "").trim().toLowerCase() === code) return true;
+        return !!word && String(it.name ?? "").toLowerCase().includes(word);
+      },
+    });
+  }, [anchorFeature, installationSurfaceName, legacyDoorWindowItems, regionDoorWindow, selectedRegion]);
+  // ─── FOAM ENCLOSURE PACKAGE ──────────────────────────────
+  // metal_s_feature_option rows of the "Foam Enclosure" feature, priced by the
+  // width/length/height band that contains the building (same match as the DB
+  // function get_feature_price). Single checkbox, no quantity.
+  const foamEnclosureFeature = useMemo(
+    () => features.find((f) => String(f.name ?? "").trim().toLowerCase().replace(/\s+/g, " ").includes("foam enclosure")) ?? null,
+    [features]
+  );
+  const foamEnclosureOption = useMemo(
+    () => (foamEnclosureFeature ? findSizeBandOption(options, foamEnclosureFeature.feature_id, width, length, height) : null),
+    [foamEnclosureFeature, options, width, length, height]
+  );
+  const foamEnclosureKey = foamEnclosureFeature ? `${foamEnclosureFeature.feature_id}:foam` : null;
+  // ─── EXTRA TRUSS BOWS (Commercial only) ───────────────────
+  // "Truss Bow" (metal_s_feature, FIXED) — option rows priced by building
+  // width band (e.g. 31–32' $1,030, 33–34' $1,050; min length 8').
+  const isCommercialStyle = resolveStyleKey(selectedStyle) === "commercial";
+  const trussBowFeature = useMemo(
+    () => otherFeatures.find((f) => String(f.name ?? "").trim().toLowerCase().replace(/\s+/g, " ") === "truss bow") ?? null,
+    [otherFeatures]
+  );
+  const trussBowOption = useMemo(
+    // Priced by width + height (Leg Height) bands; length is not used.
+    () => (trussBowFeature ? findSizeBandOption(options, trussBowFeature.feature_id, width, null, height) : null),
+    [trussBowFeature, options, width, height]
+  );
+  const trussBowKey = trussBowFeature ? `${trussBowFeature.feature_id}:bows` : null;
+
+  // "Other Fees" (labor/build-over/cut-legs/engineering) — rendered in the
+  // Others tab with the same FeatureSelector and pricing as Materials.
+  const otherFeesFeatures = useMemo(
+    () => filteredOtherFeatures.filter((f) =>
+      String(f.name ?? "").trim().toLowerCase().replace(/\s+/g, " ") === "other fees" &&
+      (isFrameGaugeFeature(f) || ["RATE", "FIXED", "PER_WALL"].includes(f.pricing_type))),
+    [filteredOtherFeatures]
+  );
+
+  // ─── SECTIONS LIST (Center + lean-tos) ───────────────────
+  const sections = useMemo(() => {
+    const list = [{ key: "center", label: "Center Section" }];
+    if (storageConfig) {
+      const side = STORAGE_LOCATIONS.find((o) => o.value === storageConfig.location)?.label ?? storageConfig.location;
+      list.push({ key: "storage", label: `Center ${side} Storage` });
+    }
+    for (const lt of leantos) {
+      const sideLabel = (leantoSides ?? []).find((s) => s.side_key === lt.side_key)?.name ?? lt.side_key;
+      list.push({ key: lt.side_key, label: `${sideLabel} Section` });
+    }
+    return list;
+  }, [leantos, leantoSides, storageConfig]);
+
+  // Walls available for current section
+  const wallsForSection = useMemo(() => {
+    if (activeSection === "storage") {
+      const walls = [
+        { key: "outer", label: "Outer Wall" },
+        { key: "inner", label: "Inner Wall" },
+      ];
+      const isSide = storageConfig?.location === "left" || storageConfig?.location === "right";
+      if (isSide) {
+        walls.push({ key: "front_end", label: "Front End" });
+        walls.push({ key: "back_end", label: "Back End" });
+      } else {
+        walls.push({ key: "left_end", label: "Left End" });
+        walls.push({ key: "right_end", label: "Right End" });
+      }
+      return walls;
+    }
+    if (activeSection === "center") {
+      return [
+        { key: "left", label: "Left Wall" },
+        { key: "back", label: "Back Wall" },
+        { key: "right", label: "Right Wall" },
+        { key: "front", label: "Front Wall" },
+      ];
+    }
+    const walls = [
+      { key: "outer", label: "Outer Wall" },
+      { key: "left_end", label: "Left End" },
+      { key: "right_end", label: "Right End" },
+    ];
+    const lt = leantos.find((entry) => entry.side_key === activeSection);
+    if (String(lt?.render_key ?? "").includes("storage")) {
+      walls.push({ key: "storage_partition", label: "Storage Inner Wall" });
+    }
+    return walls;
+  }, [activeSection, leantos, storageConfig]);
+
+  // Keep the active target valid when storage or a storage style is removed.
+  useEffect(() => {
+    if (!sections.some((sec) => sec.key === activeSection)) {
+      setActiveSection("center");
+      setActiveWall("right");
+      return;
+    }
+    if (!wallsForSection.some((wall) => wall.key === activeWall)) {
+      setActiveWall(activeSection === "center" ? "right" : activeSection === "storage" ? "inner" : "outer");
+    }
+  }, [sections, activeSection, activeWall, wallsForSection]);
+
+  // Reset wall when section changes
+
+  // ─── PRICING CALCULATIONS ────────────────────────────────
+  const basePrice = useMemo(() => {
+    if (!baseFeature) return 0;
+    if (regionBasePriceResult?.base_price != null) return Number(regionBasePriceResult.base_price);
+    return 0; // Pricing requires region + style configured
+  }, [baseFeature, regionBasePriceResult]);
+
+  const roofStyleBasePrice = useMemo(() => {
+    return Number(roofStyleBasePriceResult?.base_price ?? 0);
+  }, [roofStyleBasePriceResult]);
+
+  // Snow Load upcharge — (Base Structure Price + Leg Height Price) × the
+  // snow load upcharge rate (width + ZIP snow load tier). 0 without a rate.
+  const snowLoadUpcharge = useMemo(
+    () => computeSnowLoadUpcharge(basePrice, legHeightPrice, snowLoadRate?.rate),
+    [basePrice, legHeightPrice, snowLoadRate]
+  );
+
+  // Roof Overhang upcharge — Base Structure Price × multiplier factor from
+  // metal_s_feature_option (e.g. multiplier 0.15 → basePrice × 0.15).
+  // 0 when no width/length band matches or no factor is configured.
+  const roofOverhangUpcharge = useMemo(() => {
+    const factor = Number(roofOverhangMultiplier);
+    if (!factor) return 0;
+    return basePrice * factor;
+  }, [basePrice, roofOverhangMultiplier]);
+
+  // Roof Pitch upcharge — (W × H × L) × multiplier factor from
+  // metal_s_feature_option.multiplier (DB-driven — no factor is hardcoded).
+  // 0 when no width band matches or no factor is configured.
+  const roofPitchUpcharge = useMemo(() => {
+    const factor = Number(roofPitchMultiplier);
+    if (!factor) return 0;
+    return width * height * length * factor;
+  }, [width, height, length, roofPitchMultiplier]);
+
+  // The enclosed-wall price lookup is scoped to the "Base Structure Wall"
+  // feature (resolved by name), not the generic PANEL "Sides & Ends" feature.
+  const baseStructureWallFeature = useMemo(
+    () => features.find((f) => String(f.name ?? "").toLowerCase().includes("base structure wall")),
+    [features]
+  );
+
+  // Flat side/end/gable wall prices looked up from metal_m_panel_pricing
+  // per wall span (side walls: length × height; end walls: width × height),
+  // region, panel type, and siding style. Gable wall pricing matches
+  // metal_m_panel_pricing rows on all four parameters (siding style defaults
+  // to Horizontal).
+  const wallPanelPrices = useMemo(() => {
+    if (!baseStructureWallFeature || (wallMode !== "enclosed" && wallMode !== "gable")) {
+      return { side: 0, end: 0, gableEnd: 0 };
+    }
+    const prices = lookupWallPanelPrices({
+      panelPricing,
+      panelTypes,
+      panelPriceRegions,
+      featureId: baseStructureWallFeature.feature_id,
+      regionId: selectedRegion?.region_id ?? null,
+      width,
+      sideWidth: length,
+      height,
+      sidingStyle: DEFAULT_SIDING_STYLE,
+    });
+    return {
+      side: Number(prices.sidePrice) || 0,
+      end: Number(prices.endPrice) || 0,
+      gableEnd: Number(prices.gableEndPrice) || 0,
+    };
+  }, [wallMode, baseStructureWallFeature, panelPricing, panelTypes, panelPriceRegions, selectedRegion, width, length, height]);
+
+  // ─── STORAGE WALL PRICES (metal_m_panel_pricing) ───────────
+  // Price the four enclosing surfaces independently so the Estimate can show
+  // Right Side, Left Side, Back End and Front End. Outer/inner run along the
+  // storage strip; the two caps span its depth. Side-mounted inner walls rise
+  // with the roof pitch, while front/back inner walls mirror the outer end wall.
+  const storageWallPrices = useMemo(() => {
+    if (!storageConfig || !baseStructureWallFeature) return null;
+
+    const location = storageConfig.location;
+    const isSide = location === "left" || location === "right";
+    const span = isSide ? length : width;
+    const depth = Number(storageConfig.depthFt) || 0;
+    const rise = Number(normalizePitchName(roofPitch));
+    const outerHeight = Number(height);
+    const innerHeightRaw = isSide && Number.isFinite(rise)
+      ? outerHeight + (depth * rise) / 12
+      : outerHeight;
+    // Sheet rows are whole-foot heights and the lookup matches height exactly, so round the sloped inner-wall height UP to the next whole foot (the 1e-6 guard keeps float noise from jumping a row). End caps still use outerHeight.
+    const innerHeight = Math.ceil(innerHeightRaw - 1e-6);
+    const locationType = isSide ? "side" : "end";
+    const capLocationType = isSide ? "end" : "side";
+
+    const priceOf = (wallSpan, wallHeight, type, roundUpSpan = false) =>
+      lookupWallPanelPrice({
+        panelPricing,
+        panelTypes,
+        panelPriceRegions,
+        featureId: baseStructureWallFeature.feature_id,
+        regionId: selectedRegion?.region_id ?? null,
+        locationType: type,
+        keyword: "closed",
+        width: wallSpan,
+        height: wallHeight,
+        roundUpSpan,
+      });
+
+    const outer = priceOf(span, outerHeight, locationType);
+    const inner = priceOf(span, innerHeight, locationType);
+    // End caps span only the storage depth (e.g. 9'), usually narrower than
+    // any wall pricing row — price them at the next available size up.
+    const cap = priceOf(depth, outerHeight, capLocationType, true);
+    const prices = isSide
+      ? {
+          rightSide: location === "right" ? outer : inner,
+          leftSide: location === "left" ? outer : inner,
+          backEnd: cap,
+          frontEnd: cap,
+        }
+      : {
+          rightSide: cap,
+          leftSide: cap,
+          backEnd: location === "back" ? outer : inner,
+          frontEnd: location === "front" ? outer : inner,
+        };
+
+    return {
+      ...prices,
+      total: prices.rightSide + prices.leftSide + prices.backEnd + prices.frontEnd,
+    };
+  }, [storageConfig, baseStructureWallFeature, panelPricing, panelTypes, panelPriceRegions, selectedRegion, width, length, height, roofPitch]);
+
+  const storageWallTotal = storageWallPrices?.total ?? 0;
+
+  const panelPrice = useMemo(() => {
+    if (!panelFeature) return 0;
+    if (wallMode === "enclosed") {
+      const side = Number(wallPanelPrices.side);
+      const end = Number(wallPanelPrices.end);
+      const sideCount = panelLocations.filter((l) => l.location_type === "side").length;
+      const endCount = panelLocations.filter((l) => l.location_type === "end").length;
+      return sideCount * side + endCount * end;
+    }
+    if (wallMode === "gable") {
+      const endCount = panelLocations.filter((l) => l.location_type === "end").length;
+      return endCount * Number(wallPanelPrices.gableEnd);
+    }
+    const locs = panelLocations.filter((l) => l.feature_id === panelFeature.feature_id);
+    if (wallMode === "custom") {
+      // Custom walls are priced flat from metal_m_panel_pricing rows (panel type
+      // "Custom"); each selection is a panel_pricing_id.
+      return calcCustomTotalWallPrice(wallSelections, locs, panelPricing);
+    }
+    const opts = panelOptions.filter((o) => o.feature_id === panelFeature.feature_id);
+    return calcTotalPanelPrice(wallSelections, locs, opts, width, length);
+  }, [panelFeature, wallMode, wallPanelPrices, panelLocations, panelOptions, panelPricing, wallSelections, width, length]);
+
+  const addOnTotal = useMemo(() => {
+    return Object.values(addOnItems).reduce((sum, item) => sum + (item?.price ?? 0), 0);
+  }, [addOnItems]);
+
+  const doorWindowTotal = useMemo(() => {
+    let total = Object.values(doorWindowSelections).flat().reduce((sum, item) => sum + (Number(item.price) || 0), 0);
+    if (storageConfig) {
+      for (const items of Object.values(storageOpenings)) {
+        for (const item of items) total += (Number(item.price) || 0);
+      }
+    }
+    // Lean-to openings
+    for (const lt of leantos) {
+      if (lt.openings) {
+        for (const items of Object.values(lt.openings)) {
+          for (const item of items) total += (Number(item.price) || 0);
+        }
+      }
+    }
+    return total;
+  }, [doorWindowSelections, leantos, storageOpenings, storageConfig]);
+
+  const colorUpchargeTotal = useMemo(() => {
+    let total = 0;
+    for (const [groupId, optionId] of Object.entries(colorSelections)) {
+      const opt = colorOptions.find((o) => o.color_option_id === optionId);
+      if (opt) total += Number(opt.upcharge);
+    }
+    return total;
+  }, [colorSelections, colorOptions]);
+
+  // ─── LEAN-TO CONNECTION FEES ("Connection Fee" feature) ──
+  // Per-lean-to connection fee looked up from metal_s_feature_option ("Connection
+  // Fee" feature — the length-bucketed options) by the lean-to's Length and the
+  // selected region (lookupConnectionFee). Keyed by side_key; re-runs when
+  // lean-tos or the region change. No price is hardcoded here.
+  const [leantoConnectionFees, setLeantoConnectionFees] = useState({});
+  useEffect(() => {
+    let cancelled = false;
+    if (!selectedRegion || leantos.length === 0) {
+      setLeantoConnectionFees({});
+      return;
+    }
+    (async () => {
+      const entries = await Promise.all(leantos.map(async (lt) => {
+        try {
+          const result = await lookupConnectionFee({
+            length: lt.length_ft ?? lt.width_ft,
+            regionId: selectedRegion.region_id,
+          });
+          return [lt.side_key, Number(result?.price ?? 0)];
+        } catch {
+          return [lt.side_key, 0];
+        }
+      }));
+      if (!cancelled) setLeantoConnectionFees(Object.fromEntries(entries));
+    })();
+    return () => { cancelled = true; };
+  }, [leantos, selectedRegion]);
+
+  // ─── LEAN-TO ROOF STYLE PRICES (Roof Style matrix) ────────
+  // Per-lean-to "A-Frame Vertical/Horizontal" upcharge looked up from
+  // metal_m_feature_matrix_price via lookupRoofStyleBasePrice, keyed by
+  // side_key. Re-runs when lean-tos, their roof-style selections, or the
+  // region change.
+  const [leantoRoofPrices, setLeantoRoofPrices] = useState({});
+  useEffect(() => {
+    let cancelled = false;
+    if (!selectedRegion || leantos.length === 0) {
+      setLeantoRoofPrices({});
+      return;
+    }
+    (async () => {
+      const entries = await Promise.all(leantos.map(async (lt) => {
+        const ui = leantoUiOptions[lt.side_key] ?? LT_UI_DEFAULTS;
+        try {
+          const result = await lookupRoofStyleBasePrice({
+            roofStyle: ui.roofStyle ?? LT_UI_DEFAULTS.roofStyle,
+            width: lt.width_ft,
+            length: lt.length_ft ?? lt.width_ft,
+            regionId: selectedRegion.region_id,
+          });
+          return [lt.side_key, Number(result?.base_price ?? 0)];
+        } catch {
+          return [lt.side_key, 0];
+        }
+      }));
+      if (!cancelled) setLeantoRoofPrices(Object.fromEntries(entries));
+    })();
+    return () => { cancelled = true; };
+  }, [leantos, leantoUiOptions, selectedRegion]);
+
+  // ─── LEAN-TO BASE PRICES (Attached Lean To matrix) ────────
+  // Per-lean-to base structure price looked up from
+  // metal_m_feature_matrix_price ("Attached Lean To" feature) by the lean-to's
+  // Size (width/length) and the selected region. Keyed by side_key; re-runs
+  // when lean-tos or the region change.
+  const [leantoBasePrices, setLeantoBasePrices] = useState({});
+  useEffect(() => {
+    let cancelled = false;
+    if (!selectedRegion || leantos.length === 0) {
+      setLeantoBasePrices({});
+      return;
+    }
+    (async () => {
+      const entries = await Promise.all(leantos.map(async (lt) => {
+        try {
+          const result = await lookupLeantoBasePrice({
+            width: lt.width_ft,
+            length: lt.length_ft ?? lt.width_ft,
+            height: lt.height_ft,
+            regionId: selectedRegion.region_id,
+          });
+          return [lt.side_key, Number(result?.base_price ?? 0)];
+        } catch {
+          return [lt.side_key, 0];
+        }
+      }));
+      if (!cancelled) setLeantoBasePrices(Object.fromEntries(entries));
+    })();
+    return () => { cancelled = true; };
+  }, [leantos, selectedRegion]);
+
+  const leantoTotal = useMemo(() => {
+    let total = 0;
+    for (const lt of leantos) {
+      total += Number(leantoBasePrices[lt.side_key] ?? 0);
+      const ui = leantoUiOptions[lt.side_key] ?? LT_UI_DEFAULTS;
+      if (ui.sideConnection && ui.sideConnection !== "none") total += Number(leantoConnectionFees[lt.side_key] ?? 0);
+      // Customize by Wall panels (flat metal_m_panel_pricing price).
+      for (const cw of leantoCustomWallItems(lt, panelPricing)) total += cw.price;
+    }
+    return total;
+  }, [leantos, leantoBasePrices, leantoUiOptions, leantoConnectionFees, panelPricing]);
+
+  // ─── LEAN-TO PITCH UPCHARGES (metal_s_feature_option multipliers) ──
+  // Per-lean-to Roof Pitch upcharge = (W × H × L) × multiplier factor — the
+  // same DB-driven mechanism as the main roof pitch, scoped to the lean-to's
+  // width/length band. Keyed by side_key.
+  const leantoPitchPrices = useMemo(() => {
+    const out = {};
+    const feat = findRoofPitchFeature(features);
+    for (const lt of leantos) {
+      const ui = leantoUiOptions[lt.side_key] ?? LT_UI_DEFAULTS;
+      const row = findPitchMultiplierRow(options, feat, ui.roofPitch, lt.width_ft, lt.length_ft ?? lt.width_ft);
+      const factor = row?.multiplier != null ? Number(row.multiplier) : 0;
+      out[lt.side_key] = factor ? lt.width_ft * lt.height_ft * (lt.length_ft ?? lt.width_ft) * factor : 0;
+    }
+    return out;
+  }, [leantos, leantoUiOptions, features, options]);
+
+  const leantoPitchTotal = useMemo(
+    () => Object.values(leantoPitchPrices).reduce((sum, v) => sum + Number(v ?? 0), 0),
+    [leantoPitchPrices]
+  );
+
+  // Per-lean-to Roof Style upcharges — kept out of leantoTotal because, like
+  // the building's roofStyleBasePrice, the matrix price is region-scoped.
+  const leantoRoofStyleTotal = useMemo(() => {
+    let total = 0;
+    for (const lt of leantos) total += Number(leantoRoofPrices[lt.side_key] ?? 0);
+    return total;
+  }, [leantos, leantoRoofPrices]);
+
+  // ─── GUTTER & DOWNSPOUT PRICING ───────────────────────────
+  // Rate comes from metal_m_feature_rate (Gutter feature, linear_ft) — no
+  // hardcoded fallback. Not called when no gutters are selected or when the
+  // database has no active rate.
+  // Match the active gutter feature by name/render_key. DB data varies
+  // ("Gutter", "Gutter System"; render_key often null), so compare
+  // case-insensitively with a substring fallback. features is active-only.
+  const gutterFeature = features.find((f) => {
+    const name = String(f.name ?? "").toLowerCase().replace(/[-\s]/g, "_");
+    const key = String(f.render_key ?? "").toLowerCase().replace(/[-\s]/g, "_");
+    return name.includes("gutter") || key.includes("gutter");
+  });
+  const gutterRatePerLF = lookupFeatureRate(rates, gutterFeature?.feature_id, "linear_ft");
+  // Rate-based gutter run (calculateGutterPricing). Its rate-based
+  // downspoutPrice is overridden below by computeDownspoutPrice.
+  const gutterPricing = useMemo(() => {
+    if (guttersSelection !== "Gutters" || gutterRatePerLF == null) return null;
+    return calculateGutterPricing({
+      buildingLength: length,
+      sidewallHeights: [height, ...leantos.filter((lt) => lt.side_key === "left" || lt.side_key === "right").map((lt) => lt.height_ft)],
+      gutterSelection: RAIN_GUTTER_SIDE_KEY[rainGuttersSelection] ?? "left",
+      downspoutCount,
+      ratePerLF: gutterRatePerLF,
+    });
+  }, [guttersSelection, rainGuttersSelection, downspoutCount, length, height, leantos, gutterRatePerLF]);
+
+  // ─── DOWNSPOUT PRICE (metal_s_feature_option base price) ─
+  // Price = basePrice × (tallestSidewallHeight + 1.5) × downspoutCount, where
+  // basePrice is the metal_s_feature_option.price of the downspout option row
+  // (lookupDownspoutBasePrice) and tallestSidewallHeight (feet) spans the
+  // center section leg height plus any left/right lean-tos. The count comes
+  // from the "Number of Downspouts" UI field. Downspouts are only priced when
+  // gutters are selected; a missing base price or sidewall height yields $0.
+  const downspoutBasePrice = lookupDownspoutBasePrice(features, options);
+  const downspoutPrice = useMemo(() => {
+    if (guttersSelection !== "Gutters") return 0;
+    const heights = [height, ...leantos.filter((lt) => lt.side_key === "left" || lt.side_key === "right").map((lt) => lt.height_ft)]
+      .map(Number)
+      .filter((n) => Number.isFinite(n) && n >= 0);
+    return computeDownspoutPrice({
+      basePrice: downspoutBasePrice,
+      tallestSidewallHeight: heights.length ? Math.max(...heights) : null,
+      downspoutCount: uiDownspoutCount,
+    });
+  }, [guttersSelection, height, leantos, downspoutBasePrice, uiDownspoutCount]);
+
+  // Combined gutter + downspout pricing for the totals and the estimate
+  // drawer: the gutter run keeps calculateGutterPricing's rate-based price;
+  // the downspout line uses computeDownspoutPrice (metal_s_feature_option
+  // base price) instead of the legacy rate-based value.
+  const effectiveGutterPricing = useMemo(() => {
+    if (!gutterPricing && downspoutPrice <= 0) return null;
+    return {
+      gutterLF: gutterPricing?.gutterLF ?? 0,
+      gutterPrice: gutterPricing?.gutterPrice ?? 0,
+      downspoutLF: gutterPricing?.downspoutLF ?? 0,
+      downspoutPrice,
+    };
+  }, [gutterPricing, downspoutPrice]);
+  const gutterTotal = (effectiveGutterPricing?.gutterPrice ?? 0) + (effectiveGutterPricing?.downspoutPrice ?? 0);
+
+  const subtotal = basePrice + roofStyleBasePrice + roofOverhangUpcharge + roofPitchUpcharge + panelPrice + storageWallTotal + addOnTotal + doorWindowTotal + colorUpchargeTotal + leantoTotal + leantoRoofStyleTotal + leantoPitchTotal + legHeightPrice + gutterTotal + snowLoadUpcharge;
+
+  // Region multiplier is already baked into basePrice, roofStyleBasePrice,
+  // legHeightPrice, and the flat wall price (enclosed/gable, region-linked rows).
+  // Only apply the multiplier to the remaining non-base components.
+  // Gutter/downspout prices are region-invariant (same in all regions).
+  const grandTotal = useMemo(() => {
+    const isFlatWallPricing = wallMode === "enclosed" || wallMode === "gable";
+    // Snow load upcharge is built from the region-priced Base + Leg Height,
+    // so it is region-scoped too (no extra multiplier).
+    const regionScoped = basePrice + roofStyleBasePrice + roofOverhangUpcharge + roofPitchUpcharge + legHeightPrice + gutterTotal + leantoRoofStyleTotal + leantoPitchTotal + (isFlatWallPricing ? panelPrice : 0) + storageWallTotal + snowLoadUpcharge;
+    const regionAdjusted = (isFlatWallPricing ? 0 : panelPrice) + addOnTotal + doorWindowTotal + colorUpchargeTotal + leantoTotal;
+    return regionScoped + applyRegionMultiplier(regionAdjusted, selectedRegion);
+  }, [selectedRegion, basePrice, roofStyleBasePrice, roofOverhangUpcharge, roofPitchUpcharge, legHeightPrice, gutterTotal, leantoRoofStyleTotal, leantoPitchTotal, panelPrice, wallMode, addOnTotal, doorWindowTotal, colorUpchargeTotal, leantoTotal, storageWallTotal, snowLoadUpcharge]);
+
+  const regionAdjustment = grandTotal - subtotal;
+
+  // Estimate drawer
+  const [showEstimateDrawer, setShowEstimateDrawer] = useState(false);
+
+  // ─── DEPOSIT / DISCOUNTS & ADJUSTMENTS STATE ───────────────
+  const [depositMode, setDepositMode] = useState("standard"); // standard | customAmount | customPercentage
+  const [customDepositAmount, setCustomDepositAmount] = useState(0);
+  const [customDepositPercentage, setCustomDepositPercentage] = useState(0);
+
+  const [dealerDiscountMode, setDealerDiscountMode] = useState("amount"); // amount | percentage
+  const [dealerDiscountAmount, setDealerDiscountAmount] = useState(0);
+  const [dealerDiscountPercentage, setDealerDiscountPercentage] = useState(0);
+
+  // ─── SALES TAX MODE STATE ─────────────────────────────────
+  const [salesTaxMode, setSalesTaxMode] = useState("standard"); // standard | exempt | percentage
+  const [customTaxPercentage, setCustomTaxPercentage] = useState(7);
+
+  // ─── CUSTOM ADJUSTMENTS (Sales Tool) ──────────────────────
+  // Rows: { key, optionId, description, amount, percent, price, qty } — inputs
+  // kept as text while typing. Kind comes from the option name (see
+  // resolveAdjustmentKind). Discounts reduce the building total and the
+  // taxable amount; taxable expenses add to both; non-taxable expenses add to
+  // the total only; notes have no price.
+  const [customAdjustments, setCustomAdjustments] = useState([]);
+  const customAdjustmentCalc = useMemo(() => {
+    const byId = new Map((customAdjustmentTypes ?? []).map((t) => [String(t.id), t]));
+    const num = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : 0; };
+    let discount = 0, taxable = 0, nonTaxable = 0;
+    const lines = [];
+    for (const row of customAdjustments) {
+      const type = byId.get(String(row.optionId));
+      if (!type) continue;
+      const kind = resolveAdjustmentKind(type.option_name);
+      const label = String(row.description || "").trim() || type.option_name;
+      if (kind === "discountAmount") {
+        const amt = Math.round(num(row.amount) * 100) / 100;
+        discount += amt;
+        lines.push({ label, value: type.option_name, price: -amt, qty: 1, unitPrice: -amt });
+      } else if (kind === "discountPercent") {
+        const pct = Math.min(100, num(row.percent));
+        const amt = Math.round(grandTotal * pct) / 100;
+        discount += amt;
+        lines.push({ label, value: `${type.option_name} (${pct}%)`, price: -amt, qty: 1, unitPrice: -amt });
+      } else if (kind === "expenseTaxable" || kind === "expenseNonTaxable") {
+        const qty = Math.max(1, Math.floor(num(row.qty) || 1));
+        const amt = Math.round(num(row.price) * qty * 100) / 100;
+        if (kind === "expenseTaxable") taxable += amt; else nonTaxable += amt;
+        lines.push({ label, value: `${type.option_name} · ${qty} × $${num(row.price).toFixed(2)}`, price: amt, qty, unitPrice: num(row.price) });
+      } else {
+        lines.push({ label: "Note", value: label, note: true });
+      }
+    }
+    discount = Math.min(discount, grandTotal);
+    return { discount, taxable, nonTaxable, lines };
+  }, [customAdjustments, customAdjustmentTypes, grandTotal]);
+  // Building total after custom adjustments, and the part that is taxed.
+  const adjustedSubtotal = Math.max(0, grandTotal - customAdjustmentCalc.discount + customAdjustmentCalc.taxable + customAdjustmentCalc.nonTaxable);
+  const taxableSubtotal = Math.max(0, grandTotal - customAdjustmentCalc.discount + customAdjustmentCalc.taxable);
+
+  // Reset dimensions on style change + apply DB defaults
+  const [prevStyleId, setPrevStyleId] = useState(selectedStyleId);
+  if (prevStyleId !== selectedStyleId) {
+    setPrevStyleId(selectedStyleId);
+    // Use DB default dimensions from the style row (metal_s_style)
+    setWidth(tripleWideWidth != null ? tripleWideWidth : resolveStyleDefaultDim(selectedStyle?.default_width, widths, width));
+    setLength(tripleWideLength != null ? tripleWideLength : resolveStyleDefaultDim(selectedStyle?.default_length, lengths, length));
+    const newBackHeight = tripleWideHeight != null ? tripleWideHeight : resolveStyleDefaultDim(selectedStyle?.default_height, heights, height);
+    setHeight(newBackHeight);
+    // Free Standing Lean To: default the Front (short) eave to Back − 2ft
+    // (the reference 12×20×9×7), snapped to the offered height list.
+    setFrontHeight(snapFrontHeight(Math.max(4, newBackHeight - 2), newBackHeight));
+    // Triple Wide: default the roofing/pitch/overhang controls to the garage
+    // reference (Vertical, 3/12, 6") using the style profile defaults.
+    if (isTripleWideStyle) {
+      const twStructure = getStyleProfile(resolveStyleKey(selectedStyle))?.structureDefaults ?? {};
+      setRoofing(DEFAULT_ROOFING);
+      setRoofPitch(twStructure.roofPitch ?? getRoofPitchOptionNames(features, options)[0] ?? "");
+      setRoofOverhang(twStructure.roofOverhang ?? DEFAULT_ROOF_OVERHANG);
+    }
+    // Wall mode from DB has_walls flag (Loafing Shed always starts enclosed)
+    const defaultMode = getDefaultWallMode(selectedStyle);
+    setWallMode(defaultMode);
+    // Step Down Barn: default the center front to gable-only for the new style
+    setFrontGableDefault(resolveStyleKey(selectedStyle) === "step_down_barn");
+    // Loafing Shed: reset roof extension selection when changing styles
+    setRoofExtensionSelection("Roof Extension");
+    // Rebuild wall selections to match new mode
+    if (panelFeature && panelLocations.length > 0 && panelOptions.length > 0 && defaultMode !== "custom") {
+      const newSelections = {};
+      for (const loc of panelLocations) {
+        let targetType = "open";
+        if (defaultMode === "enclosed") targetType = "enclosed";
+        else if (defaultMode === "gable") targetType = loc.location_type === "end" ? "gable" : "open";
+        const opt = panelOptions.find(
+          (o) => o.feature_id === panelFeature.feature_id && o.location_type === loc.location_type && o.render_type === targetType
+        );
+        if (opt) newSelections[loc.location_id] = opt.option_id;
+      }
+      setWallSelections(newSelections);
+    }
+    // Reset all other configuration options to their defaults
+    setSidingOptionId(null);
+    // Seed doors/windows from the new style's defaultSetup openings (e.g.
+    // Garage: front 10×10 roll-up + left prehung door and window);
+    // styles without a defaultSetup get empty walls.
+    setDoorWindowSelections(resolveDefaultOpenings(doorWindowItems, getStyleProfile(resolveStyleKey(selectedStyle)).defaultSetup?.openings));
+    setColorSelections(resolveDefaultColorSelections(
+      colorGroups,
+      colorOptions,
+      getStyleProfile(resolveStyleKey(selectedStyle)).defaultSetup?.colors
+    ));
+    setLeantos([]);
+    setLeantoUiOptions({});
+    setCollapsedLeantos({});
+    setStorageAdded(false);
+    setStorageLocation("none");
+    setStorageCollapsed(false);
+    setStorageDepth(9);
+    setStorageOpenings({ inner: [] });
+    setActiveSection("center");
+    setActiveWall("right");
+    setEditingItemIdx(null);
+    setConstraintWarning(null);
+    setTouchedWallIds(new Set());
+    // Reset Sales Tool state
+    setDepositMode("standard");
+    setCustomDepositAmount(0);
+    setCustomDepositPercentage(0);
+    setDealerDiscountMode("amount");
+    setDealerDiscountAmount(0);
+    setDealerDiscountPercentage(0);
+    setSalesTaxMode("standard");
+    setCustomTaxPercentage(7);
+    setCustomAdjustments([]);
+  }
+
+  const effectiveTaxRate = useMemo(() => {
+    if (salesTaxMode === "exempt") return 0;
+    if (salesTaxMode === "percentage") {
+      const pct = Number(customTaxPercentage) || 0;
+      return Math.max(0, Math.min(pct, 100)) / 100;
+    }
+    return salesTaxRate; // standard
+  }, [salesTaxMode, customTaxPercentage, salesTaxRate]);
+
+  const computedSalesTaxAmount = useMemo(() => {
+    return Math.round(taxableSubtotal * effectiveTaxRate * 100) / 100;
+  }, [taxableSubtotal, effectiveTaxRate]);
+
+  const computedDepositAmount = useMemo(() => {
+    if (depositMode === "standard") return 0;
+    if (depositMode === "customAmount") return Number(customDepositAmount) || 0;
+    if (depositMode === "customPercentage") {
+      return Math.round((adjustedSubtotal * (Number(customDepositPercentage) || 0)) / 100 * 100) / 100;
+    }
+    return 0;
+  }, [depositMode, customDepositAmount, customDepositPercentage, adjustedSubtotal]);
+
+  const computedDealerDiscount = useMemo(() => {
+    if (depositMode === "standard" || computedDepositAmount <= 0) return 0;
+    if (dealerDiscountMode === "amount") return Math.min(Number(dealerDiscountAmount) || 0, computedDepositAmount);
+    if (dealerDiscountMode === "percentage") {
+      return Math.min(
+        Math.round((computedDepositAmount * (Number(dealerDiscountPercentage) || 0)) / 100 * 100) / 100,
+        computedDepositAmount
+      );
+    }
+    return 0;
+  }, [depositMode, computedDepositAmount, dealerDiscountMode, dealerDiscountAmount, dealerDiscountPercentage]);
+
+  const isDealerDiscountInvalid = useMemo(() => {
+    if (dealerDiscountMode === "amount") {
+      return Number(dealerDiscountAmount) > computedDepositAmount;
+    }
+    if (dealerDiscountMode === "percentage") {
+      return Number(dealerDiscountPercentage) > 100 || (computedDepositAmount <= 0 && Number(dealerDiscountPercentage) > 0);
+    }
+    return false;
+  }, [dealerDiscountMode, dealerDiscountAmount, dealerDiscountPercentage, computedDepositAmount]);
+
+  const depositAmountDueNow = useMemo(() => {
+    return Math.max(0, computedDepositAmount - computedDealerDiscount);
+  }, [computedDepositAmount, computedDealerDiscount]);
+
+  const dueUponDeliveryAmount = useMemo(() => {
+    const totalEstimate = adjustedSubtotal + computedSalesTaxAmount;
+    return Math.max(0, totalEstimate - depositAmountDueNow);
+  }, [adjustedSubtotal, computedSalesTaxAmount, depositAmountDueNow]);
+
+  // Walls map used for the 3D preview, openings validation and the order-form
+  // floor plan. Defined above the estimate memo — buildEstimate forwards it
+  // into the printed plan.
+  //
+  // Wall mode is the source of truth for the mode presets: the buttons must
+  // always render in 3D regardless of metal_s_panel_option rows, which may be
+  // missing or carry stale/NULL render_type values (enclosed-wall pricing comes
+  // from metal_m_panel_pricing). Only "custom" resolves per-wall selections.
+  const wallsBase3d = useMemo(() => {
+    if (wallMode === "enclosed") {
+      return { front: "enclosed", back: "enclosed", left: "enclosed", right: "enclosed" };
+    }
+    if (wallMode === "gable") {
+      return { front: "gable", back: "gable", left: false, right: false };
+    }
+    if (wallMode === "open") {
+      return { front: false, back: false, left: false, right: false };
+    }
+    // "custom" — resolve each wall's selection to a render type
+    const result = { front: false, back: false, left: false, right: false };
+    if (!panelFeature) return result;
+    // Same location list the Per-Wall dropdowns render (all panelLocations) so
+    // every selection shown in the UI resolves to a wall in the 3D — the old
+    // feature_id filter could silently drop locations some DBs link to another
+    // feature (e.g. "Base Structure Wall"), leaving the wall unrendered.
+    const locs = panelLocations;
+    for (const loc of locs) {
+      let wallType = false;
+      // Custom selections are panel_pricing_ids; derive the render type from the
+      // row's option_name (metal_m_panel_pricing has no render_type column).
+      // deriveCustomRenderType handles "Extended Gable End - N' Panel" →
+      // ext_gable_N, "Top - N' Panel" → top_N, "Open" → false (frame only).
+      const row = findCustomWallRow(panelPricing, wallSelections[loc.location_id]);
+      if (row) wallType = deriveCustomRenderType(row);
+      if (loc.name.includes("Front")) result.front = wallType;
+      else if (loc.name.includes("Back")) result.back = wallType;
+      else if (loc.name.includes("Left")) result.left = wallType;
+      else if (loc.name.includes("Right")) result.right = wallType;
+    }
+    return result;
+  }, [panelFeature, panelLocations, panelPricing, wallSelections, wallMode]);
+
+  // Step Down Barn: the center front defaults to gable-only (open porch), and
+  // the center's left/right walls default open so each step-down wing is open
+  // on its inner-facing side into the center aisle. Both overrides clear when
+  // the user picks a wall mode or edits a wall in Sides & Ends.
+  const walls3d = useMemo(
+    () => (frontGableDefault ? { ...wallsBase3d, front: "gable", left: false, right: false } : wallsBase3d),
+    [wallsBase3d, frontGableDefault]
+  );
+
+  // ─── INSULATION AREAS ─────────────────────────────────────
+  // Shown when an Insulation Material other than "No Insulation" is chosen.
+  // Per section (center + each lean-to): Roof + every wall that isn't open.
+  // Listed in the estimate; no price change.
+  const insulationFeature = features.find((f) => String(f.name ?? "").trim().toLowerCase().replace(/\s+/g, " ") === "insulation material") ?? null;
+  const insulationItem = insulationFeature ? addOnItems[insulationFeature.feature_id] : null;
+  const showInsulationAreas = !!insulationItem && !/^no\b/i.test(String(insulationItem.description ?? "").trim());
+  const insulationSections = useMemo(() => {
+    const wallOn = (v) => !!v && v !== "open";
+    const center = {
+      key: "center",
+      title: "Center Section Insulation",
+      prefix: "Center Section",
+      areas: [
+        { key: "roof", label: "Roof" },
+        ...[["left", "Left Sidewall"], ["right", "Right Sidewall"], ["back", "Back Wall"], ["front", "Front Wall"]]
+          .filter(([k]) => wallOn(walls3d?.[k]))
+          .map(([k, label]) => ({ key: k, label })),
+      ],
+    };
+    const leans = (leantos ?? []).map((lt) => {
+      const side = lt.side_key;
+      const sideName = side.charAt(0).toUpperCase() + side.slice(1);
+      return {
+        key: side,
+        title: `${sideName} Lean Insulation`,
+        prefix: `${sideName} Lean`,
+        areas: [
+          { key: "roof", label: "Roof" },
+          ...["left_end", "right_end", "outer"]
+            .filter((wk) => wallOn(lt.walls?.[wk]))
+            .map((wk) => ({ key: wk, label: leantoWallLabel(side, wk) })),
+        ],
+      };
+    });
+    return [center, ...leans];
+  }, [walls3d, leantos]);
+  // One estimate line per checked (still available) area, e.g.
+  // `Center Section 2" Fiberglass Insulation: Roof - Insulation` (no price).
+  const insulationName = String(insulationItem?.description ?? "").trim();
+  const insulationAreaRows = useMemo(() => {
+    if (!showInsulationAreas) return [];
+    return insulationSections.flatMap((s) =>
+      s.areas
+        .filter((a) => insulationAreas[`${s.key}:${a.key}`])
+        .map((a) => ({ label: `${s.prefix} ${insulationName} Insulation: ${a.label} - Insulation` }))
+    );
+  }, [showInsulationAreas, insulationSections, insulationAreas, insulationName]);
+
+  const estimate = useMemo(() => buildEstimate({
+    selectedStyle,
+    width,
+    length,
+    height,
+    legHeightPrice,
+    basePrice,
+    roofStyleBasePrice,
+    wallSelections,
+    walls: walls3d,
+    panelFeature,
+    panelLocations,
+    panelOptions,
+    panelPricing,
+    panelTypes,
+    wallMode,
+    wallPanelPrices,
+    storageWallPrices,
+    storageDepthFt: storageConfig?.depthFt ?? null,
+    sidingStyle: DEFAULT_SIDING_STYLE,
+    jTrimSelection,
+    colorGroups,
+    colorOptions,
+    colorSelections,
+    addOnItems,
+    features,
+    doorWindowSelections,
+    storageOpenings: storageConfig ? storageOpenings : null,
+    doorWindowItems,
+    leantos,
+    leantoBasePrices,
+    leantoStyles,
+    leantoUiOptions,
+    leantoRoofPrices,
+    leantoPitchPrices,
+    leantoConnectionFees,
+    selectedStyleId,
+    selectedRegion,
+    zipCode,
+    zipCity,
+    zipStateCode,
+    subtotal,
+    grandTotal,
+    regionAdjustment,
+    taxRate: effectiveTaxRate,
+    deposit: computedDepositAmount,
+    discount: computedDealerDiscount,
+    customAdjustmentLines: customAdjustmentCalc.lines,
+    customDiscountTotal: customAdjustmentCalc.discount,
+    customTaxableTotal: customAdjustmentCalc.taxable,
+    customNonTaxableTotal: customAdjustmentCalc.nonTaxable,
+    roofing,
+    roofOverhang,
+    roofOverhangUpcharge,
+    roofPitch,
+    roofPitchUpcharge,
+    gutterPricing: effectiveGutterPricing,
+    gutterSideLabel: rainGuttersSelection,
+    // Downspouts are only listed when gutters are selected — passing 0 for
+    // "No Gutters" keeps the default count from showing a stray row.
+    downspoutCount: guttersSelection === "Gutters" ? uiDownspoutCount : 0,
+    // Snow load upcharge row (only when a rate applies).
+    snowLoadUpcharge,
+    snowLoadRatePct: snowLoadRate ? formatSnowLoadRatePct(snowLoadRate.rate) : null,
+    snowLoadPsf: snowLoadRate ? snowLoad : null,
+    // Panel Upgrade Scope row (only while a non-standard upgrade is selected).
+    panelUpgradeScope: showPanelUpgradeScope ? panelUpgradeScope : null,
+    // Insulation areas (no price) — listed under the Insulation Material row.
+    insulationAreaRows,
+  }), [selectedStyle, width, length, height, legHeightPrice, basePrice, roofStyleBasePrice, wallSelections, panelFeature, panelLocations, panelOptions, panelPricing, panelTypes, wallMode, wallPanelPrices, storageWallPrices, jTrimSelection, colorGroups, colorOptions, colorSelections, addOnItems, features, doorWindowSelections, storageOpenings, storageConfig, doorWindowItems, leantos, leantoBasePrices, leantoStyles, leantoUiOptions, leantoRoofPrices, leantoPitchPrices, leantoConnectionFees, selectedStyleId, selectedRegion, zipCode, zipCity, zipStateCode, subtotal, grandTotal, regionAdjustment, effectiveTaxRate, computedDepositAmount, computedDealerDiscount, customAdjustmentCalc, roofing, roofOverhang, roofOverhangUpcharge, roofPitch, roofPitchUpcharge, effectiveGutterPricing, rainGuttersSelection, guttersSelection, uiDownspoutCount, walls3d, snowLoadUpcharge, snowLoadRate, snowLoad, showPanelUpgradeScope, panelUpgradeScope, insulationAreaRows]);
+
+  // ─── WALL PANEL INIT ─────────────────────────────────────
+  const [wallSelectionsInited, setWallSelectionsInited] = useState(false);
+  if (!wallSelectionsInited && panelLocations.length > 0 && panelOptions.length > 0) {
+    setWallSelectionsInited(true);
+    // Default walls from the selected style's has_walls flag:
+    // carports (has_walls=false) → all Open (no panel → no cost),
+    // garages/barns (has_walls=true) → Enclosed. Loafing Shed → Enclosed.
+    const defaultMode = getDefaultWallMode(selectedStyle);
+    const initial = {};
+    for (const loc of panelLocations) {
+      const opt = panelOptions.find(
+        (o) => o.feature_id === panelFeature?.feature_id && o.location_type === loc.location_type && o.render_type === defaultMode
+      ) || panelOptions.find(
+        (o) => o.feature_id === panelFeature?.feature_id && o.location_type === loc.location_type
+      );
+      if (opt) initial[loc.location_id] = opt.option_id;
+    }
+    setWallSelections(initial);
+  }
+
+  // ─── ADD-ON HANDLER ──────────────────────────────────────
+  const updateAddOn = useCallback((featureId, item) => {
+    setAddOnItems((prev) => {
+      const next = { ...prev };
+      if (!item) delete next[featureId];
+      else next[featureId] = item;
+      return next;
+    });
+  }, []);
+
+  // Brackets / Anchors: when the delivery region (or, for Anchors, the
+  // installation surface) changes, re-price checked items from the resolved
+  // options; drop one that is no longer available.
+  useEffect(() => {
+    const groups = [
+      { feature: bracketFeature, options: bracketOptions, label: "Bracket", reason: "has no price for this region" },
+      { feature: anchorFeature, options: anchorOptions, label: "Anchor", reason: "does not match this region or installation surface" },
+    ];
+    for (const { feature, options: opts, label, reason } of groups) {
+      if (!feature) continue;
+      const prefix = `${feature.feature_id}:`;
+      const byKey = new Map(opts.map((o) => [`${prefix}${o.option_id}`, o]));
+      for (const [key, item] of Object.entries(addOnItems)) {
+        if (!item || !key.startsWith(prefix)) continue;
+        const opt = byKey.get(key);
+        if (!opt) {
+          updateAddOn(key, null);
+          toastWarning(`${item.optionName ?? label} ${reason} and was removed.`);
+          continue;
+        }
+        const unit = Number(opt.price) || 0;
+        if (unit !== item.unitPrice) {
+          const q = item.qty ?? 1;
+          updateAddOn(key, { ...item, unitPrice: unit, price: unit * q });
+        }
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- re-run only when the resolved prices change
+  }, [bracketOptions, bracketFeature, anchorOptions, anchorFeature, updateAddOn]);
+
+  // Foam Enclosure: keep the checked add-on priced from the matching size band;
+  // remove it (warning toast) when the building size has no price.
+  useEffect(() => {
+    if (!foamEnclosureKey) return;
+    const cur = addOnItems[foamEnclosureKey];
+    if (!cur) return;
+    if (!foamEnclosureOption) {
+      updateAddOn(foamEnclosureKey, null);
+      toastWarning(`No Foam Enclosure price is set for a ${width}' x ${length}' x ${height}' building, so it was removed.`, "No price for this size");
+      return;
+    }
+    const unit = Number(foamEnclosureOption.price) || 0;
+    if (cur.unitPrice === unit && cur.optionName === foamEnclosureOption.name) return;
+    updateAddOn(foamEnclosureKey, {
+      ...cur,
+      unitPrice: unit,
+      price: unit,
+      optionName: foamEnclosureOption.name,
+      description: foamEnclosureOption.name,
+    });
+  }, [foamEnclosureKey, foamEnclosureOption, addOnItems, updateAddOn, width, length, height]);
+
+  // Extra Truss Bows: keep the stored add-on priced from the size band that
+  // matches the current building. When the size has no price, remove it and
+  // tell the user (warning toast).
+  useEffect(() => {
+    if (!trussBowKey) return;
+    const cur = addOnItems[trussBowKey];
+    if (!cur) return;
+    if (!trussBowOption) {
+      updateAddOn(trussBowKey, null);
+      toastWarning(`No Extra Truss Bows price is set for a ${width}' wide building, so the bows were removed.`, "No price for this width");
+      return;
+    }
+    const unit = Number(trussBowOption.price) || 0;
+    if (cur.unitPrice === unit && cur.optionName === trussBowOption.name) return;
+    const q = cur.qty ?? 1;
+    updateAddOn(trussBowKey, {
+      ...cur,
+      unitPrice: unit,
+      price: unit * q,
+      optionName: trussBowOption.name,
+      description: `${trussBowOption.name} (x${q})`,
+    });
+  }, [trussBowKey, trussBowOption, addOnItems, updateAddOn, width]);
+
+  // ─── ANCHOR PACKAGE (driven by Installation Surface) ─────
+  const surfaceFeature = features.find((f) => f.name === "Installation Surface" || f.render_key === "installation_surface");
+  const anchorPackageFeature = features.find((f) => f.name === "Anchor Package" || f.render_key === "anchor_package");
+
+  const syncAnchorPackage = useCallback((surfaceItem) => {
+    if (!anchorPackageFeature) return;
+    const surfaceName = surfaceItem?.description ?? null;
+    // Concrete (or no) surface needs no anchor package — clear any existing one
+    // so it never contributes to the estimate.
+    if (!surfaceName || surfaceName === DEFAULT_INSTALLATION_SURFACE) {
+      updateAddOn(anchorPackageFeature.feature_id, null);
+      return;
+    }
+    const match = lookupOptionByDimensions(options, anchorPackageFeature.feature_id, width, length);
+    if (match) {
+      updateAddOn(anchorPackageFeature.feature_id, {
+        featureId: anchorPackageFeature.feature_id,
+        featureName: anchorPackageFeature.name,
+        description: match.name,
+        price: Number(match.price),
+      });
+    } else {
+      // No size band matches this building — no anchor charge
+      updateAddOn(anchorPackageFeature.feature_id, null);
+    }
+  }, [anchorPackageFeature, options, width, length, updateAddOn]);
+
+  // Handler for the Installation Surface selector — updates the surface
+  // add-on and re-syncs the anchor package price for non-concrete surfaces.
+  const handleInstallationSurfaceChange = useCallback((featureId, item) => {
+    updateAddOn(featureId, item);
+    syncAnchorPackage(item);
+  }, [updateAddOn, syncAnchorPackage]);
+
+  // Re-lookup the anchor package price when width/length change while a
+  // non-concrete installation surface is active.
+  useEffect(() => {
+    const surfaceItem = surfaceFeature ? addOnItems[surfaceFeature.feature_id] : null;
+    if (surfaceItem?.description && surfaceItem.description !== DEFAULT_INSTALLATION_SURFACE) {
+      syncAnchorPackage(surfaceItem);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [width, length]);
+
+  // ─── ROOF OVERHANG MULTIPLIER (metal_s_feature_option) ─────
+  // The overhang options carry a `multiplier` scoped by width/length bands
+  // (min_width/max_width, min_length/max_length — null bounds = unbounded).
+  const roofOverhangFeature = useMemo(
+    () => features.find((f) => f.render_key === "roof_overhang"),
+    [features]
+  );
+
+  // Look up the metal_s_feature_option row for an overhang selection matching
+  // the building's width/length. Option names are matched by overhang SIZE, not
+  // literally: the UI renders `12"` (inch mark) while DB rows may be named
+  // `12'` (foot mark) / `12` / `12 inch`, etc. Normalizing to the numeric
+  // value keeps both spellings equivalent.
+  const lookupRoofOverhangOption = useCallback((overhangName, w, l) => {
+    if (!roofOverhangFeature || !overhangName) return null;
+    const wantSize = normalizeOverhangName(overhangName);
+    const candidates = options
+      .filter((o) => o.feature_id === roofOverhangFeature.feature_id && o.is_active !== false && normalizeOverhangName(o.name) === wantSize)
+      .sort((a, b) => ((a.sort_order ?? 0) - (b.sort_order ?? 0)) || ((a.option_id ?? 0) - (b.option_id ?? 0)));
+    return candidates.find((o) => {
+      const minW = o.min_width != null ? Number(o.min_width) : null;
+      const maxW = o.max_width != null ? Number(o.max_width) : null;
+      const minL = o.min_length != null ? Number(o.min_length) : null;
+      const maxL = o.max_length != null ? Number(o.max_length) : null;
+      if (minW != null && w < minW) return false;
+      if (maxW != null && w > maxW) return false;
+      if (minL != null && l < minL) return false;
+      if (maxL != null && l > maxL) return false;
+      return true;
+    }) ?? null;
+  }, [roofOverhangFeature, options]);
+
+  // Handler for the Roof Overhang selector — stores the selection and looks
+  // up its multiplier factor from metal_s_feature_option.
+  const handleRoofOverhangChange = useCallback((overhangName) => {
+    setRoofOverhang(overhangName);
+    const match = lookupRoofOverhangOption(overhangName, width, length);
+    setRoofOverhangMultiplier(match?.multiplier != null ? Number(match.multiplier) : 0);
+  }, [lookupRoofOverhangOption, width, length]);
+
+  // Re-lookup the overhang multiplier when the selection, dimensions, or
+  // style change (width/length bands may resolve to a different option row).
+  useEffect(() => {
+    const match = lookupRoofOverhangOption(roofOverhang, width, length);
+    setRoofOverhangMultiplier(match?.multiplier != null ? Number(match.multiplier) : 0);
+  }, [selectedStyleId, roofOverhang, width, length, lookupRoofOverhangOption]);
+
+  // ─── ROOF PITCH MULTIPLIER (metal_s_feature_option) ──────
+  // The pitch options carry a `multiplier` scoped by width bands
+  // (min_width/max_width — null bounds = unbounded). Upcharge is computed as
+  // (W × H × L) × multiplier — the factor always comes from the DB row.
+  const roofPitchFeature = useMemo(() => findRoofPitchFeature(features), [features]);
+
+  // Distinct pitch choices for the selectors — straight from the DB option
+  // rows (never hardcoded in the UI).
+  const roofPitchOptions = useMemo(() => getRoofPitchOptionNames(features, options), [features, options]);
+
+  // Look up the metal_s_feature_option row for a pitch selection matching the
+  // building's width/length. Option names are matched by pitch RISE, not
+  // literally: the UI renders `4/12` while DB rows may be named `4:12` or `4`.
+  // Normalizing to the numeric rise keeps all spellings equivalent.
+  const lookupRoofPitchOption = useCallback((pitchName, w, l) =>
+    findPitchMultiplierRow(options, roofPitchFeature, pitchName, w, l),
+  [roofPitchFeature, options]);
+
+  // Handler for the Roof Pitch selector — stores the selection and looks up
+  // its multiplier factor from metal_s_feature_option.
+  const handleRoofPitchChange = useCallback((pitchName) => {
+    setRoofPitch(pitchName);
+    const match = lookupRoofPitchOption(pitchName, width, length);
+    setRoofPitchMultiplier(match?.multiplier != null ? Number(match.multiplier) : 0);
+  }, [lookupRoofPitchOption, width, length]);
+
+  // Re-lookup the pitch multiplier when the selection, dimensions, or style
+  // change (width bands may resolve to a different option row).
+  useEffect(() => {
+    const match = lookupRoofPitchOption(roofPitch, width, length);
+    setRoofPitchMultiplier(match?.multiplier != null ? Number(match.multiplier) : 0);
+  }, [selectedStyleId, roofPitch, width, length, lookupRoofPitchOption]);
+
+  // Siding panel pricing — update add-on when siding option changes
+  const changeSidingOption = useCallback((optId) => {
+    setSidingOptionId(optId);
+    if (!sidingFeature) return;
+    if (!optId) { updateAddOn(sidingFeature.feature_id, null); return; }
+    const opt = sidingOptions.find((o) => o.option_id === optId);
+    if (!opt) { updateAddOn(sidingFeature.feature_id, null); return; }
+    updateAddOn(sidingFeature.feature_id, { featureId: sidingFeature.feature_id, featureName: sidingFeature.name, description: opt.name, price: Number(opt.price) });
+  }, [sidingFeature, sidingOptions, updateAddOn]);
+
+  // ─── DOOR/WINDOW ADD/REMOVE (section-aware + constraints) ──
+  // 3D drag/selection plumbing: posFt = feet from the wall's center along the
+  // wall axis, sillFt = feet from the floor to the opening's bottom edge
+  // (both written by the 3D drag); selectedOpening drives the 3D
+  // dimension callouts and syncs with the "Items on wall" list below.
+  const moveItemOnWall = useCallback((wall, idx, posFt, sillFt = 0) => {
+    // Center Storage openings live in their own bucket (storageOpenings) keyed
+    // by the storage wall — route those keys there; anything else is a
+    // center-section wall (left/right/front/back) in doorWindowSelections.
+    if (STORAGE_WALL_KEYS.has(wall)) {
+      setStorageOpenings((prev) => {
+        const next = applyOpeningMove(prev[wall], idx, posFt, sillFt);
+        return next ? { ...prev, [wall]: next } : prev;
+      });
+      return;
+    }
+    setDoorWindowSelections((prev) => {
+      const next = applyOpeningMove(prev[wall], idx, posFt, sillFt);
+      return next ? { ...prev, [wall]: next } : prev;
+    });
+  }, []);
+
+  const handleSelectOpening = useCallback((wall, idx) => {
+    setSelectedOpening(wall == null || idx == null ? null : { wall, idx });
+  }, []);
+
+  const addItemToWall = (item) => {
+    // ── Engineering constraint check ──
+    const wallW = getWallWidthFt(activeWall, activeSection, width, length, leantos, storageConfig);
+    const wallH = getWallHeightFt(activeSection, height, leantos, activeWall);
+    const validation = validateItemForWall(item, currentWallItems, wallW, wallH);
+    if (!validation.ok) {
+      setConstraintWarning(validation.reason);
+      return;
+    }
+    setConstraintWarning(null);
+
+    if (activeSection === "storage") {
+      setStorageOpenings((prev) => ({
+        ...prev,
+        [activeWall]: placeOpeningInWall(prev[activeWall] || [], {
+          item_id: item.item_id, name: item.name, price: item.price, item_type: item.item_type,
+        }, wallW),
+      }));
+      return;
+    }
+
+    if (activeSection === "center") {
+      setDoorWindowSelections((prev) => {
+        const list = prev[activeWall] || [];
+        return {
+          ...prev,
+          [activeWall]: placeOpeningInWall(
+            list,
+            { item_id: item.item_id, name: item.name, price: item.price, item_type: item.item_type },
+            getWallWidthFt(activeWall, "center", width, length, leantos)
+          ),
+        };
+      });
+    } else {
+      // Lean-to
+      const ltIdx = leantos.findIndex((lt) => lt.side_key === activeSection);
+      if (ltIdx < 0) return;
+      setLeantos((prev) => prev.map((entry, i) => {
+        if (i !== ltIdx) return entry;
+        const openings = entry.openings || { outer: [], left_end: [], right_end: [] };
+        return {
+          ...entry,
+          openings: { ...openings, [activeWall]: [...(openings[activeWall] || []), { item_id: item.item_id, name: item.name, price: item.price, item_type: item.item_type }] }
+        };
+      }));
+    }
+  };
+
+  const removeItemFromWall = (removeIdx) => {
+    setSelectedOpening(null);
+    if (activeSection === "storage") {
+      setStorageOpenings((prev) => {
+        const list = [...(prev[activeWall] || [])];
+        list.splice(removeIdx, 1);
+        return { ...prev, [activeWall]: list };
+      });
+      return;
+    }
+    if (activeSection === "center") {
+      setDoorWindowSelections((prev) => {
+        const list = [...(prev[activeWall] || [])];
+        list.splice(removeIdx, 1);
+        return { ...prev, [activeWall]: list };
+      });
+    } else {
+      const ltIdx = leantos.findIndex((lt) => lt.side_key === activeSection);
+      if (ltIdx < 0) return;
+      setLeantos((prev) => prev.map((entry, i) => {
+        if (i !== ltIdx) return entry;
+        const openings = entry.openings || { outer: [], left_end: [], right_end: [] };
+        const list = [...(openings[activeWall] || [])];
+        list.splice(removeIdx, 1);
+        return { ...entry, openings: { ...openings, [activeWall]: list } };
+      }));
+    }
+  };
+
+  // Items on current wall
+  const currentWallItems = useMemo(() => {
+    if (activeSection === "storage") return storageOpenings[activeWall] || [];
+    if (activeSection === "center") return doorWindowSelections[activeWall] || [];
+    const found = leantos.find((x) => x.side_key === activeSection);
+    if (!found || !found.openings) return [];
+    return found.openings[activeWall] || [];
+  }, [activeSection, activeWall, doorWindowSelections, leantos, storageOpenings]);
+
+  const replaceItemOnWall = (replaceIdx, newItem) => {
+    // Validate the replacement (exclude the item being replaced from existing)
+    const wallW = getWallWidthFt(activeWall, activeSection, width, length, leantos, storageConfig);
+    const wallH = getWallHeightFt(activeSection, height, leantos, activeWall);
+    const otherItems = currentWallItems.filter((_, i) => i !== replaceIdx);
+    const validation = validateItemForWall(newItem, otherItems, wallW, wallH);
+    if (!validation.ok) {
+      setConstraintWarning(validation.reason);
+      return;
+    }
+    setConstraintWarning(null);
+
+    if (activeSection === "storage") {
+      setStorageOpenings((prev) => {
+        const list = [...(prev[activeWall] || [])];
+        list[replaceIdx] = {
+          item_id: newItem.item_id, name: newItem.name, price: newItem.price, item_type: newItem.item_type,
+          posFt: list[replaceIdx]?.posFt, sillFt: list[replaceIdx]?.sillFt,
+        };
+        return { ...prev, [activeWall]: list };
+      });
+      return;
+    }
+
+    if (activeSection === "center") {
+      setDoorWindowSelections((prev) => {
+        const list = [...(prev[activeWall] || [])];
+        list[replaceIdx] = { item_id: newItem.item_id, name: newItem.name, price: newItem.price, item_type: newItem.item_type, posFt: list[replaceIdx]?.posFt, sillFt: list[replaceIdx]?.sillFt };
+        return { ...prev, [activeWall]: list };
+      });
+    } else {
+      const ltIdx = leantos.findIndex((lt) => lt.side_key === activeSection);
+      if (ltIdx < 0) return;
+      setLeantos((prev) => prev.map((entry, i) => {
+        if (i !== ltIdx) return entry;
+        const openings = entry.openings || { outer: [], left_end: [], right_end: [] };
+        const list = [...(openings[activeWall] || [])];
+        list[replaceIdx] = { item_id: newItem.item_id, name: newItem.name, price: newItem.price, item_type: newItem.item_type };
+        return { ...entry, openings: { ...openings, [activeWall]: list } };
+      }));
+    }
+  };
+
+  const duplicateItemOnWall = (dupIdx) => {
+    const item = currentWallItems[dupIdx];
+    if (!item) return;
+    addItemToWall({ item_id: item.item_id, name: item.name, price: item.price, item_type: item.item_type });
+  };
+
+
+  // (wallsBase3d / walls3d moved above the estimate memo — the order-form
+  // floor plan needs them at buildEstimate time.)
+
+  // Per-wall siding seam direction for the 3D preview: custom rows may carry
+  // their own Horizontal/Vertical style (siding_style column or the
+  // option_name prefix). Null entries fall back to the global Siding Panel
+  // setting; preset modes keep the global setting for every wall.
+  const wallsSiding3d = useMemo(() => {
+    const empty = { front: null, back: null, left: null, right: null };
+    if (wallMode !== "custom" || !panelFeature) return empty;
+    const result = { ...empty };
+    for (const loc of panelLocations) {
+      const row = findCustomWallRow(panelPricing, wallSelections[loc.location_id]);
+      const style = row ? deriveCustomSidingStyle(row) : null;
+      if (loc.name.includes("Front")) result.front = style;
+      else if (loc.name.includes("Back")) result.back = style;
+      else if (loc.name.includes("Left")) result.left = style;
+      else if (loc.name.includes("Right")) result.right = style;
+    }
+    return result;
+  }, [panelFeature, panelLocations, panelPricing, wallSelections, wallMode]);
+
+  // ─── 3D PREVIEW PROPS ────────────────────────────────────
+  // Read-only derivations for the 3D renderer — no pricing impact.
+  const roofStyle3d = resolveStyleKey(selectedStyle);
+  const defaultRoofPitch = selectedStyle?.default_roof_pitch ?? 0.25;
+
+  const sidingDirection = useMemo(() => {
+    const opt = sidingOptions.find((o) => o.option_id === sidingOptionId);
+    if (!opt) {
+      // No Siding Panel choice → the style profile's default siding
+      // (defaultSetup.siding, e.g. Commercial "Vertical"); else horizontal.
+      const def = String(getStyleProfile(resolveStyleKey(selectedStyle))?.defaultSetup?.siding ?? "").toLowerCase();
+      return def.includes("vertical") ? "vertical" : "horizontal";
+    }
+    return opt?.name?.toLowerCase().includes("vertical") ? "vertical" : "horizontal";
+  }, [sidingOptions, sidingOptionId, selectedStyle]);
+
+  // Roof pitch label ("4/12", "4:12", or "4") → rise/run ratio for the renderer.
+  const roofPitchRatio = useMemo(() => {
+    const cleaned = String(roofPitch ?? "").trim();
+    if (!cleaned) return null;
+    const m = cleaned.match(/^(\d+(?:\.\d+)?)\s*[/:]\s*(\d+(?:\.\d+)?)/);
+    if (m) {
+      const rise = Number(m[1]);
+      const run = Number(m[2]);
+      return run > 0 ? rise / run : null;
+    }
+    const num = Number(cleaned);
+    return Number.isFinite(num) ? num / 12 : null;
+  }, [roofPitch]);
+
+  // Roof overhang label ('6"', '12"', '18"') → feet for the renderer.
+  const roofOverhangFt = useMemo(() => {
+    const size = normalizeOverhangName(roofOverhang);
+    return Number.isFinite(size) ? size / 12 : 0;
+  }, [roofOverhang]);
+
+  // Clamp lean-to dimensions to the building envelope (preview only).
+  const clampedLeantos = useMemo(() => {
+    return leantos.map((lt) => {
+      const isSide = lt.side_key === "left" || lt.side_key === "right";
+      const maxW = isSide ? width : length;
+      const maxH = height;
+      const maxLen = isSide ? length : width;
+      const clampedWidth = lt.width_ft >= maxW ? Math.max(1, maxW - 1) : lt.width_ft;
+      const clampedHeight = lt.height_ft >= maxH ? Math.max(1, maxH - 1) : lt.height_ft;
+      const clampedLen = lt.length_ft > maxLen ? maxLen : lt.length_ft;
+      if (clampedWidth !== lt.width_ft || clampedHeight !== lt.height_ft || clampedLen !== lt.length_ft) {
+        return { ...lt, width_ft: clampedWidth, height_ft: clampedHeight, length_ft: clampedLen };
+      }
+      return lt;
+    });
+  }, [leantos, width, length, height]);
+
+  // ─── LEAN-TO HEIGHT FOLLOWS CENTER LEG HEIGHT ─────────────
+  // When the center section's leg height is adjusted, every lean-to's leg
+  // height re-defaults to center − 4 ft (snapped to a listed option) so the
+  // rule established when adding a lean-to keeps holding. Price lookups
+  // re-run automatically because they depend on `leantos`.
+  const prevCenterHeightRef = useRef(height);
+  useEffect(() => {
+    if (prevCenterHeightRef.current === height) return;
+    prevCenterHeightRef.current = height;
+    const ltHeights = getLeantoHeights().filter((v) => v < height);
+    const desired = (() => {
+      const hint = Math.max(1, height - 4);
+      if (!ltHeights.length) return hint;
+      const within = ltHeights.filter((v) => v <= hint);
+      return within.length ? Math.max(...within) : ltHeights[0];
+    })();
+    setLeantos((prev) => prev.map((lt) => (lt.height_ft === desired ? lt : { ...lt, height_ft: desired })));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [height]);
+
+  // ─── LEAN-TO ROOF PITCH → WALL ATTACH ────────────────────
+  // The Roof Pitch adjusts the INNER edge — where the lean-to roof meets the
+  // center section's wall — while the outer leg height stays as chosen (the
+  // Leg Height selector / center − 4 rule own it). The 3D lean-to takes the
+  // wall attach as `attachDropFt` (ft below the center eave), derived here:
+  // attach = leg + (rise/12) × width → drop = height − attach (≥ 0, i.e.
+  // clamped at the eave when pitch × width + leg height doesn't fit under it).
+  const previewLeantos = useMemo(() => clampedLeantos.map((lt) => {
+    const ltUi = leantoUiOptions[lt.side_key] ?? {};
+    // Per-lean-to Roof Style drives that lean-to's groove direction.
+    const roofPanelDir = ltUi.roofStyle === "Horizontal" ? "horizontal" : "vertical";
+    // Corner wrap flags (Standard Roofline) render in the 3D preview.
+    const wrapFlags = {
+      wrapFront: ltUi.wrapFront === "Standard Roofline",
+      wrapBack: ltUi.wrapBack === "Standard Roofline",
+      wrapLeft: ltUi.wrapLeft === "Standard Roofline",
+      wrapRight: ltUi.wrapRight === "Standard Roofline",
+    };
+    const pitchName = ltUi.roofPitch || defaultPitchOption(roofPitchOptions);
+    const rise = Number(normalizePitchName(pitchName));
+    // "Enclosed Lean with Storage": interior partition depth for the preview
+    // (same depth-driven behavior as Center Storage).
+    const storageCfg = String(lt.render_key ?? "").includes("storage") && Number(ltUi.storageDepth) > 0
+      ? { depthFt: Number(ltUi.storageDepth) }
+      : null;
+    if (!Number.isFinite(rise)) return { ...lt, ...wrapFlags, roofPanelDir, storage: storageCfg };
+    const attachFt = lt.height_ft + (rise / 12) * lt.width_ft;
+    return { ...lt, ...wrapFlags, attachDropFt: Math.max(0, height - attachFt), roofPanelDir, storage: storageCfg };
+  }), [clampedLeantos, leantoUiOptions, roofPitchOptions, height]);
+
+  // Highlighted wall for 3D preview (openings tab uses activeWall, lean-to tab uses activeSection)
+  const highlightedWall = rightPanelMode === "openings"
+    ? (activeSection === "center" ? activeWall : `${activeSection}:${activeWall}:${leantoFocusTick}`)
+    : rightPanelMode === "leantos" && activeSection !== "center" ? `${activeSection}:${leantoFocusTick}`
+    : null;
+
+  // ─── 3D VIEW CAPTURE (Order Form building images) ─────────
+  const captureViewsRef = useRef(null);
+  const handleCaptureReady = useCallback((fn) => {
+    captureViewsRef.current = fn;
+  }, []);
+  const captureViews = useCallback(() => (captureViewsRef.current ? captureViewsRef.current() : null), []);
+
+  // Disable body scroll
+  useEffect(() => {
+    document.body.style.overflow = "hidden";
+    return () => { document.body.style.overflow = ""; };
+  }, []);
+
+  // ─── ITEM TYPES from DB ──────────────────────────────────
+  const itemTypes = useMemo(() => {
+    if (!doorWindowItems || doorWindowItems.length === 0) return [];
+    return [...new Set(doorWindowItems.map((i) => resolveOpeningType(i)))];
+  }, [doorWindowItems]);
+
+  // ─── ADD LEAN-TO HELPER ──────────────────────────────────
+  // Build a default lean-to object for a side. Width/Height snap to the
+  // "Attached Lean To" matrix options — when a sizeHint is given (Step Down
+  // Barn defaults) the largest option not exceeding the hint wins. Without a
+  // hint, the leg height defaults to the center section's leg height minus
+  // 4 ft (snapped to the closest listed option at or below it).
+  const makeDefaultLeanto = (sideKey, sizeHint = null) => {
+    const defaultStyle = availableLeantoStyles[0];
+    if (!defaultStyle) return null;
+    const isSideNew = sideKey === "left" || sideKey === "right";
+    const ltWidths = getLeantoWidths().filter((v) => v < (isSideNew ? width : length));
+    const ltHeights = getLeantoHeights().filter((v) => v < height);
+    const maxLen = isSideNew ? length : width;
+    const ltLengths = getLeantoLengths().filter((v) => v <= maxLen);
+    const defaultLength = ltLengths.length ? Math.max(...ltLengths) : maxLen;
+    const pickSize = (opts, hint, fallback) => {
+      if (!opts.length) return hint ?? fallback;
+      if (hint == null) return opts[0];
+      const within = opts.filter((v) => v <= hint);
+      return within.length ? Math.max(...within) : opts[0];
+    };
+    return {
+      leanto_style_id: defaultStyle.leanto_style_id,
+      render_key: defaultStyle.render_key,
+      side_key: sideKey,
+      width_ft: pickSize(ltWidths, sizeHint?.widthFt, 10),
+      height_ft: pickSize(ltHeights, sizeHint?.heightFt ?? Math.max(1, height - 4), 6),
+      length_ft: defaultLength,
+      wallMode: "open",
+      walls: applyLtWallMode("open"),
+      // Front frame-out only when the size hint asks for one (Step Down Barn
+      // defaults); lean-tos added by the user start with no openings.
+      openings: { outer: [], left_end: isSideNew && sizeHint?.frontFrameout ? [defaultLeantoFrontFrameout(doorWindowItems, sizeHint.frontFrameout)] : [], right_end: [] },
+    };
+  };
+
+  const addLeanTo = (sideKey) => {
+    const usedSides = new Set(leantos.map((x) => x.side_key));
+    if (usedSides.has(sideKey)) return;
+    const lt = makeDefaultLeanto(sideKey);
+    if (!lt) return;
+    setLeantos((prev) => [...prev, lt]);
+    setLeantoUiOptions((prev) => ({ ...prev, [sideKey]: { ...LT_UI_DEFAULTS } }));
+    setActiveSection(sideKey);
+    setActiveWall("outer");
+  };
+
+  // ─── STEP DOWN BARN — left/right sections are real lean-tos ──
+  // Auto-add the style profile's defaultLeantos while the style is active;
+  // drop only the auto-added ones (autoStepDown) when switching away.
+  useEffect(() => {
+    const stepSpec = getStyleProfile(resolveStyleKey(selectedStyle)).rendering.stepDown;
+    if (stepSpec?.defaultLeantos) {
+      const used = new Set(leantos.map((x) => x.side_key));
+      const adds = stepSpec.defaultLeantos
+        .filter((d) => !used.has(d.side_key))
+        .map((d) => {
+          const lt = makeDefaultLeanto(d.side_key, d);
+          return lt
+            ? {
+                ...lt,
+                autoStepDown: true,
+                ...(d.wallMode ? { wallMode: d.wallMode, walls: applyLtWallMode(d.wallMode) ?? lt.walls } : {}),
+              }
+            : null;
+        })
+        .filter(Boolean);
+      if (adds.length) {
+        setLeantos((prev) => [...prev, ...adds]);
+        setLeantoUiOptions((prev) => {
+          const next = { ...prev };
+          for (const lt of adds) next[lt.side_key] = { ...LT_UI_DEFAULTS };
+          return next;
+        });
+      }
+    } else if (leantos.some((lt) => lt.autoStepDown)) {
+      setLeantos((prev) => prev.filter((lt) => !lt.autoStepDown));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedStyleId]);
+
+  const removeLeanTo = (sideKey) => {
+    setLeantos((prev) => prev.filter((lt) => lt.side_key !== sideKey));
+    setLeantoUiOptions((prev) => {
+      const next = { ...prev };
+      delete next[sideKey];
+      return next;
+    });
+    setCollapsedLeantos((prev) => {
+      const next = { ...prev };
+      delete next[sideKey];
+      return next;
+    });
+    setActiveSection("center");
+    setActiveWall("right");
+  };
+
+  // J-Trim section (Sides & Ends tab) — visible with at least one side lean-to
+  // (left or right) and no lean-tos on the ends (front/back).
+  const leantoSideKeys = new Set(leantos.map((lt) => lt.side_key));
+  const showJTrimSection =
+    (leantoSideKeys.has("left") || leantoSideKeys.has("right")) &&
+    !leantoSideKeys.has("front") && !leantoSideKeys.has("back");
+
+  // ─── RENDER ──────────────────────────────────────────────
+  return (
+    <div className="d-flex" style={{ height: "calc(100vh - 56px)", overflow: "hidden", margin: 0 }}>
+      {/* ═══ LEFT: 3D Preview ═══ */}
+      <div style={{ flex: "0 0 70%", position: "relative", background: "#f5f5f5", pointerEvents: zipLocked ? "none" : undefined, userSelect: zipLocked ? "none" : undefined }}>
+        {/* 3D preview — BuildingPreviewV2, wired like ConfiguratorViewV2 */}
+        <BuildingPreview
+          width={width} length={length} height={height}
+          frontHeight={isFreeStandingLeanto ? effFrontHeight : loafingLowEave}
+          roofStyle={roofStyle3d} roofPitch={roofPitchRatio} defaultRoofPitch={defaultRoofPitch}
+          roofOverhang={roofOverhangFt} walls={walls3d} wallSiding={wallsSiding3d} highlightedWall={highlightedWall}
+          sidingDirection={sidingDirection}
+          roofPanelDir={roofing === "Horizontal" ? "horizontal" : "vertical"}
+          roofColor={(() => { const grp = colorGroups.find(g => g.render_target === "roof"); if (!grp) return "#C89B68"; const opt = resolveSelectedColorOption(colorOptions, grp.color_group_id, colorSelections[grp.color_group_id]); return opt?.hex_code ?? "#C89B68"; })()}
+          wallColor={(() => { const grp = colorGroups.find(g => g.render_target === "wall"); if (!grp) return "#e0e0e0"; const opt = resolveSelectedColorOption(colorOptions, grp.color_group_id, colorSelections[grp.color_group_id]); return opt?.hex_code ?? "#e0e0e0"; })()}
+          twoToneColor={(() => { const grp = colorGroups.find(g => g.render_target === "two_tone"); if (!grp) return null; const opt = colorOptions.find(o => o.color_option_id === colorSelections[grp.color_group_id]); if (!opt || opt.name === "None") return null; return opt.hex_code; })()}
+          trimColor={(() => { const grp = colorGroups.find(g => g.render_target === "trim" || g.name?.toLowerCase() === "trim"); if (!grp) return "#C89B68"; const opt = colorOptions.find(o => o.color_option_id === colorSelections[grp.color_group_id]); return opt?.hex_code ?? "#C89B68"; })()}
+          storage={storageConfig} leantos={previewLeantos} openings={doorWindowSelections}
+          onMoveOpening={moveItemOnWall} onSelectOpening={handleSelectOpening} selectedOpening={selectedOpening}
+          onWallSelect={rightPanelMode === "openings" ? handlePreviewWallSelect : null}
+          selectedWall={rightPanelMode === "openings" ? { section: activeSection, wall: activeWall } : null}
+          gutters={guttersSelection === "Gutters" ? (RAIN_GUTTER_SIDE_KEY[rainGuttersSelection] ?? "left") : "none"}
+          downspoutCount={guttersSelection === "Gutters" ? uiDownspoutCount : 0}
+          installationSurface={addOnItems[surfaceFeature?.feature_id]?.description ?? DEFAULT_INSTALLATION_SURFACE}
+          roofExtension={roofExtensionFt}
+          onCaptureReady={handleCaptureReady}
+          showGrid={false}
+        />
+
+        </div>
+
+      {/* ═══ RIGHT: Configuration Panel ═══ */}
+      <div style={{ flex: `0 0 ${RIGHT_PANEL_WIDTH}`, display: "flex", flexDirection: "column", position: "relative", minWidth: 0, pointerEvents: zipLocked ? "none" : undefined, userSelect: zipLocked ? "none" : undefined }} className="psb-config-panel">
+        {/* Fixed header */}
+        <div className="p-3 border-bottom" style={{ flexShrink: 0 }}>
+          <div className="psb-config-title">{selectedStyle?.name} ({width}×{length}×{height}{isFreeStandingLeanto ? `×${effFrontHeight}` : loafingLowEave != null ? `×${loafingLowEave}` : ""})</div>
+          
+          {/* Fixed location panel (above buttons) */}
+          {/* Re-enabled while the configurator is locked so this panel is the
+              only available action: it reopens the Delivery Location modal. */}
+          <div className="psb-loc mt-2" style={{ pointerEvents: zipLocked ? "auto" : undefined, userSelect: zipLocked ? "auto" : undefined }}>
+            <div className="psb-loc-head">
+              <span className="psb-loc-eyebrow">
+                <AppIcon icon="truck" /> Deliver to
+              </span>
+              <button type="button" className="psb-loc-change" onClick={reopenZipModal}>
+                <AppIcon icon="pen" /> {zipCode ? "Change" : "Enter ZIP"}
+              </button>
+            </div>
+
+            {zipCode ? (
+              <>
+                <div className="psb-loc-main">
+                  <span className="psb-loc-pin"><AppIcon icon="location-dot" /></span>
+                  <div className="psb-loc-text">
+                    <div className="psb-loc-city">
+                      {zipCity || `ZIP ${zipCode}`}{zipStateCode ? `, ${zipStateCode}` : ""}
+                    </div>
+                    <div className="psb-loc-sub">
+                      ZIP {zipCode} · {selectedRegion ? `${selectedRegion.name} region` : "No region — default pricing"}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="psb-loc-chips">
+                  {/* Snow load for the delivery ZIP (metal_s_snowload_data) */}
+                  {snowLoadStatus === "loading" && (
+                    <span className="psb-chip"><AppIcon icon="snowflake" /> Snow load…</span>
+                  )}
+                  {snowLoadStatus === "found" && snowLoad != null && (
+                    <span className="psb-chip psb-chip--info" title="Ground snow load for this ZIP">
+                      <AppIcon icon="snowflake" /> {snowLoad} psf
+                    </span>
+                  )}
+                  {/* Snow load upcharge rate for the width + ZIP snow load tier (metal_s_snowload_rate) */}
+                  {snowLoad != null && (snowLoadRate ? (
+                    <span className="psb-chip psb-chip--warn"
+                      title={`Snow load upcharge: ${width}' wide, ${snowLoadRate.snowLoad} psf tier`}>
+                      <AppIcon icon="arrow-trend-up" /> +{formatSnowLoadRatePct(snowLoadRate.rate)} snow upcharge
+                    </span>
+                  ) : (
+                    <span className="psb-chip" title={`No snow load upcharge for ${width}' width at ${snowLoad} psf`}>
+                      No snow upcharge
+                    </span>
+                  ))}
+                </div>
+
+                {(snowLoadStatus === "missing" || snowLoadStatus === "error") && (
+                  <div className="psb-loc-note">
+                    <span>{snowLoadStatus === "error" ? "Snow load lookup failed." : "No snow load on file."}</span>
+                    <button type="button" className="psb-loc-change" onClick={openSnowLoadModal}>
+                      <AppIcon icon="plus" /> Add Snow Load
+                    </button>
+                  </div>
+                )}
+              </>
+            ) : (
+              <div className="psb-loc-empty">Enter a ZIP code to see pricing for the delivery area.</div>
+            )}
+          </div>
+
+          {/* Mode buttons */}
+          <div className="psb-tabs mt-2">
+            {[
+              { mode: "building", icon: "building", label: "Style" },
+              { mode: "size", icon: "ruler-combined", label: "Size" },
+              { mode: "leantos", icon: "layer-group", label: "Sides & Ends" },
+              { mode: "openings", icon: "door-open", label: "Doors & Windows" },
+              { mode: "colors", icon: "palette", label: "Colors" },
+              { mode: "materials", icon: "gear", label: "Materials" },
+              { mode: "salestax", icon: "receipt", label: "Sales Tool" },
+              { mode: "services", icon: "shield", label: "Others" },
+            ].map(({ mode, icon, label }) => (
+              <Button key={mode} type="button" variant="ghost"
+                className={`psb-tab-btn ${rightPanelMode === mode ? "is-active" : ""}`}
+                aria-pressed={rightPanelMode === mode}
+                title={label}
+                onClick={() => setRightPanelMode(mode)}>
+                <AppIcon icon={icon} /> <span className="psb-tab-label">{label}</span>
+              </Button>
+            ))}
+          </div>
+        </div>
+
+        {/* Scrollable content */}
+        <div style={{ flex: 1, overflowY: "auto", overflowX: "hidden", display: "flex", flexDirection: "column", minHeight: 0 }}>
+
+        {/* ─── TAB: BUILDING (Style) ──── */}
+        {rightPanelMode === "building" && (
+          <div className="p-3">
+            {/* Style */}
+            <div className="fw-semibold mb-2">Building Style</div>
+            <div className="row row-cols-4 g-2 mb-3">
+              {styles.map((style) => (
+                <div key={style.style_id} className="col">
+                  <div
+                    className={`card h-100 text-center p-1 ${selectedStyleId === style.style_id ? "border-primary border-2" : ""}`}
+                    style={{ cursor: "pointer" }}
+                    onClick={() => handleStyleChange(style.style_id)}
+                  >
+                    <img src={getStyleIconPath(style)} alt={style.name} className="d-block mx-auto" style={{ width: 120, height: 100, maxWidth: "100%", objectFit: "contain" }} />
+                    <div className="small" style={{ fontSize: "0.75rem" }}>{style.name}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Installation Surface */}
+            {(() => {
+              const surfaceFeat = features.find((f) => f.name === "Installation Surface" || f.render_key === "installation_surface");
+              if (!surfaceFeat) return null;
+              return (<>
+                <SectionDivider />
+                <FeatureSelector feature={surfaceFeat} options={options} rates={rates} addOnItems={addOnItems} updateAddOn={handleInstallationSurfaceChange} width={width} length={length} panelLocations={panelLocations} />
+              </>);
+            })()}
+
+            <SectionDivider />
+            {/* Roofing */}
+            <div className="mb-3">
+              <div className="fw-semibold mb-2">
+                Roofing:{" "}
+                {roofing === "Horizontal" ? "A-Frame Horizontal" : "A-Frame Vertical"}
+              </div>
+              <div className="d-flex flex-column gap-2">
+                {[
+                  { value: "Vertical", label: "A-Frame Vertical" },
+                  { value: "Horizontal", label: "A-Frame Horizontal" },
+                ].map((opt) => (
+                  <div key={opt.value} className="form-check d-flex align-items-center">
+                    <input
+                      className="form-check-input"
+                      type="radio"
+                      name="roofing"
+                      id={`roofing-${opt.value}`}
+                      value={opt.value}
+                      checked={!!roofing && roofing === opt.value}
+                      onChange={() => setRoofing(opt.value)}
+                      style={{ width: "1.25rem", height: "1.25rem", marginRight: "0.5rem", marginTop: 0, flexShrink: 0 }}
+                    />
+                    <label className="form-check-label" htmlFor={`roofing-${opt.value}`}>
+                      {opt.label}
+                    </label>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Roof Pitch — hidden for the Loafing Shed (fixed 3/12) */}
+            {!isLoafingShed && (<>
+            <SectionDivider />
+            {/* Roof Pitch */}
+            <div className="mb-3">
+              <div className="fw-semibold mb-2">
+                Roof Pitch: {roofPitch || "—"}
+                {roofPitchUpcharge > 0 && (
+                  <span className="text-muted fw-normal ms-2">+{formatCurrency(roofPitchUpcharge)}</span>
+                )}
+              </div>
+              <div className="d-flex flex-column gap-2">
+                {roofPitchOptions.length === 0 && (
+                  <div className="text-muted small">No roof pitch options configured.</div>
+                )}
+                {roofPitchOptions.map((pitch) => (
+                  <div key={pitch} className="form-check d-flex align-items-center">
+                    <input
+                      className="form-check-input"
+                      type="radio"
+                      name="roof-pitch"
+                      id={`roof-pitch-${pitch.replace("/", "-")}`}
+                      value={pitch}
+                      checked={!!roofPitch && roofPitch === pitch}
+                      onChange={() => handleRoofPitchChange(pitch)}
+                      style={{ width: "1.25rem", height: "1.25rem", marginRight: "0.5rem", marginTop: 0, flexShrink: 0 }}
+                    />
+                    <label className="form-check-label" htmlFor={`roof-pitch-${pitch.replace("/", "-")}`}>
+                      {pitch}
+                    </label>
+                  </div>
+                ))}
+              </div>
+            </div>
+            </>)}
+
+            <SectionDivider />
+            {/* Roof Overhang */}
+            <div className="mb-3">
+              <div className="fw-semibold mb-2">Roof Overhang: {roofOverhang || '6"'}</div>
+              <div className="d-flex flex-column gap-2">
+                {['6"', '12"', '18"'].map((overhang) => (
+                  <div key={overhang} className="form-check d-flex align-items-center">
+                    <input
+                      className="form-check-input"
+                      type="radio"
+                      name="roof-overhang"
+                      id={`roof-overhang-${overhang.replace('"', "")}`}
+                      value={overhang}
+                      checked={!!roofOverhang && roofOverhang === overhang}
+                      onChange={() => handleRoofOverhangChange(overhang)}
+                      style={{ width: "1.25rem", height: "1.25rem", marginRight: "0.5rem", marginTop: 0, flexShrink: 0 }}
+                    />
+                    <label className="form-check-label" htmlFor={`roof-overhang-${overhang.replace('"', "")}`}>
+                      {overhang}
+                    </label>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {isLoafingShed && (<>
+              <SectionDivider />
+              <div className="mb-3">
+                <div className="fw-semibold mb-2">Roof Extension</div>
+                <div className="d-flex flex-column gap-2">
+                  {[null, "Roof Extension"].map((opt) => {
+                    const id = `roof-extension-${opt === null ? "none" : opt.toLowerCase().replace(/\s+/g, "-")}`;
+                    return (
+                      <div key={opt === null ? "none" : opt} className="form-check d-flex align-items-center">
+                        <input
+                          className="form-check-input"
+                          type="radio"
+                          name="roof-extension"
+                          id={id}
+                          value={opt === null ? "none" : opt}
+                          checked={roofExtensionSelection === (opt === null ? "none" : "Roof Extension")}
+                          onChange={(e) => setRoofExtensionSelection(opt === null ? "none" : "Roof Extension")}
+                          style={{ width: "1.25rem", height: "1.25rem", marginRight: "0.5rem", marginTop: 0, flexShrink: 0 }}
+                        />
+                        <label className="form-check-label" htmlFor={id}>
+                          {opt === null ? "None" : opt}
+                        </label>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </>)}
+
+            <SectionDivider />
+            {/* Gutters (UI state only — not wired to pricing yet) */}
+            <div className="mb-3">
+              <div className="fw-semibold mb-2">Gutters</div>
+              <div className="d-flex flex-column gap-2">
+                {["No Gutters", "Gutters"].map((opt) => {
+                  const id = `gutters-${opt.toLowerCase().replace(/\s+/g, "-")}`;
+                  return (
+                    <div key={opt} className="form-check d-flex align-items-center">
+                      <input
+                        className="form-check-input"
+                        type="radio"
+                        name="gutters"
+                        id={id}
+                        value={opt}
+                        checked={guttersSelection === opt}
+                        onChange={() => setGuttersSelection(opt)}
+                        style={{ width: "1.25rem", height: "1.25rem", marginRight: "0.5rem", marginTop: 0, flexShrink: 0 }}
+                      />
+                      <label className="form-check-label" htmlFor={id}>
+                        {opt}
+                      </label>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {guttersSelection === "Gutters" && (<>
+              <SectionDivider />
+              {/* Rain Gutters (drives gutter pricing) */}
+              <div className="mb-3">
+                <div className="text-muted mb-2">Rain Gutters: {rainGuttersSelection}</div>
+                <div className="d-flex flex-column gap-2">
+                  {["Left Side Gutters", "Right Side Gutters", "Both Sides Gutters"].map((opt) => {
+                    const id = `rain-gutters-${opt.toLowerCase().replace(/\s+/g, "-")}`;
+                    return (
+                      <div key={opt} className="form-check d-flex align-items-center">
+                        <input
+                          className="form-check-input"
+                          type="radio"
+                          name="rain-gutters"
+                          id={id}
+                          value={opt}
+                          checked={rainGuttersSelection === opt}
+                          onChange={() => {
+                            setRainGuttersSelection(opt);
+                            // The gutter side re-seeds the downspout default
+                            // (standard carport only): Both Sides → 4, one side → 2.
+                            if (isStandardCarportStyle(selectedStyle)) {
+                              setUiDownspoutCount(getDefaultDownspoutCount(selectedStyle, opt));
+                            }
+                          }}
+                          style={{ width: "1.25rem", height: "1.25rem", marginRight: "0.5rem", marginTop: 0, flexShrink: 0 }}
+                        />
+                        <label className="form-check-label" htmlFor={id}>
+                          {opt}
+                        </label>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <SectionDivider />
+              {/* Number of Downspouts — drives the downspout price (computeDownspoutPrice) and the estimate */}
+              <div className="mb-3">
+                <label className="text-muted mb-2" htmlFor="downspout-count">Number of Downspouts</label>
+                <input
+                  id="downspout-count"
+                  type="number"
+                  className="form-control"
+                  min={0}
+                  max={10}
+                  step={1}
+                  value={uiDownspoutCount}
+                  onChange={(e) => {
+                    const n = Math.trunc(Number(e.target.value) || 0);
+                    setUiDownspoutCount(Math.min(10, Math.max(0, n)));
+                  }}
+                />
+              </div>
+            </>)}
+          </div>
+        )}
+
+        {/* ─── TAB: SIZE (Width / Frame Length / Leg Height) ──── */}
+        {rightPanelMode === "size" && (
+          <div className="p-3">
+            {/* Dimensions — main structure */}
+            <div className="fw-semibold mb-2">Center Section: {width}&apos;x{length}&apos;x{height}&apos;{isFreeStandingLeanto ? `x${effFrontHeight}'` : loafingLowEave != null ? `x${loafingLowEave}'` : ""}</div>
+            {selectedRegion && !regionBasePriceResult && (
+              <div className="text-warning small mb-2">
+                <AppIcon icon="ban" className="me-1" />
+                No Base Structure price is configured for this size in {selectedRegion.name ?? "the selected region"} — the estimate will show $0 until a pricing row (width &times; length) is added for this style.
+              </div>
+            )}
+            <div className="row g-2 mb-3">
+              <div className={isFreeStandingLeanto ? "col-3" : "col-4"}>
+                <label className="form-label small mb-0">Width</label>
+                <select className="form-select form-select-sm" value={width}
+                  onChange={(e) => handleWidthChange(Number(e.target.value))}>
+                  {[...new Set([width, ...widths])].sort((a, b) => a - b).map((w) => <option key={w} value={w}>{w}&apos;</option>)}
+                </select>
+              </div>
+              <div className={isFreeStandingLeanto ? "col-3" : "col-4"}>
+                <label className="form-label small mb-0">Frame Length</label>
+                <select className="form-select form-select-sm" value={length}
+                  onChange={(e) => setLength(Number(e.target.value))}>
+                  {[...new Set([length, ...lengths])].sort((a, b) => a - b).map((l) => <option key={l} value={l}>{l}&apos;</option>)}
+                </select>
+              </div>
+              <div className={isFreeStandingLeanto ? "col-3" : "col-4"}>
+                <label className="form-label small mb-0">{isFreeStandingLeanto ? "Back Height" : "Leg Height"}</label>
+                <select className="form-select form-select-sm" value={height}
+                  onChange={(e) => setHeight(Number(e.target.value))}>
+                  {[...new Set([height, ...heights])].sort((a, b) => a - b).map((hv) => <option key={hv} value={hv}>{legHeightLabel(hv)}</option>)}
+                </select>
+              </div>
+              {isFreeStandingLeanto && (
+                <DimensionSpinner label="Front Height" value={effFrontHeight} options={frontHeightOptions} onChange={setFrontHeight} col="col-3" />
+              )}
+            </div>
+
+            {/* Per-lean-to sizes — reflected here and editable in Sides & Ends (kept in sync) */}
+            {leantos.map((lt, ltIdx) => {
+              const sideLabel = (leantoSides ?? []).find((s) => s.side_key === lt.side_key)?.name ?? lt.side_key;
+              const isSide = lt.side_key === "left" || lt.side_key === "right";
+              const ltWidths = getLeantoWidths();
+              const ltHeights = getLeantoHeights();
+              const maxLen = isSide ? length : width;
+              const ltLengths = getLeantoLengths().filter((v) => v <= maxLen);
+              if (ltLengths.length === 0) ltLengths.push(maxLen);
+              ltLengths.sort((a, b) => a - b);
+              return (
+                <div key={lt.side_key}>
+                  <SectionDivider />
+                  <div className="fw-semibold mb-2">{sideLabel} Section: {lt.width_ft}&apos;x{lt.length_ft ?? maxLen}&apos;x{lt.height_ft}&apos;</div>
+                  <div className="row g-2 mb-3">
+                    <div className="col-4">
+                      <label className="form-label small mb-0">Width</label>
+                      <select className="form-select form-select-sm" value={lt.width_ft}
+                        onChange={(e) => setLeantos((prev) => prev.map((item, i) => i === ltIdx ? { ...item, width_ft: Number(e.target.value) } : item))}>
+                        {ltWidths.filter((v) => v < (isSide ? width : length)).map((w) => <option key={w} value={w}>{w}&apos;</option>)}
+                      </select>
+                    </div>
+                    <div className="col-4">
+                      <label className="form-label small mb-0">Frame Length</label>
+                      <select className="form-select form-select-sm" value={lt.length_ft}
+                        onChange={(e) => setLeantos((prev) => prev.map((item, i) => i === ltIdx ? { ...item, length_ft: Number(e.target.value) } : item))}>
+                        {ltLengths.map((v) => <option key={v} value={v}>{v}&apos;</option>)}
+                      </select>
+                    </div>
+                    <div className="col-4">
+                      <label className="form-label small mb-0">Leg Height</label>
+                      <select className="form-select form-select-sm" value={lt.height_ft}
+                        onChange={(e) => setLeantos((prev) => prev.map((item, i) => i === ltIdx ? { ...item, height_ft: Number(e.target.value) } : item))}>
+                        {ltHeights.filter((v) => v < height).map((h) => <option key={h} value={h}>{h}&apos;</option>)}
+                      </select>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* ─── TAB: SIDES & ENDS (Walls + Lean-Tos) ────────────────────────────── */}
+        {rightPanelMode === "leantos" && (
+          <div className="p-3">
+            {/* Walls — main building sides & ends */}
+            <div className="fw-semibold mb-2">Wall Style: {wallMode || 'Open'}</div>
+            <div className="mb-3">
+              <div className="d-flex gap-1 flex-wrap">
+                {["open", "enclosed", "gable", "custom"].map((m) => (
+                  <button key={m}
+                    className={`btn btn-sm flex-fill ${wallMode === m ? "btn-dark" : "btn-outline-secondary"}`}
+                    onClick={() => applyMode(m)}>
+                    {m.charAt(0).toUpperCase() + m.slice(1)}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {wallMode === "custom" && panelFeature && <SectionDivider />}
+            {wallMode === "custom" && panelFeature && (
+              <div className="mb-3">
+                <div className="small fw-semibold mb-2">Per-Wall Panels</div>
+                {panelLocations.map((loc) => {
+                  // Custom wall options come from metal_m_panel_pricing where the
+                  // panel type is "Custom" (matched to this wall's location_type).
+                  const locOpts = getCustomWallOptions({
+                    panelPricing,
+                    panelTypes,
+                    locationType: loc.location_type,
+                  });
+                  return (
+                    <div key={loc.location_id} className="mb-2">
+                      <label className="form-label small mb-0">{loc.name}</label>
+                      <select className="form-select form-select-sm"
+                        value={wallSelections[loc.location_id] ?? ""}
+                        onChange={(e) => changeWallSelection(loc.location_id, e.target.value)}>
+                        <option value="">Open (No Panel)</option>
+                        {locOpts.map((o) => (
+                          <option key={o.panel_pricing_id} value={o.panel_pricing_id}>{o.label}</option>
+                        ))}
+                      </select>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {showJTrimSection && (<>
+              <SectionDivider />
+              {/* J-Trim (UI state only — not wired to pricing). Sides-only lean-to
+                  setups: at least one side lean-to, none on the ends. */}
+              <div className="mb-3">
+                <div className="fw-semibold mb-2">J-Trim: <span className="text-muted">{jTrimSelection}</span></div>
+                <div className="d-flex flex-column gap-2">
+                  {["None on Sides", "Add J-Trim (Sides)"].map((opt) => {
+                    const id = `j-trim-${opt.toLowerCase().replace(/\s+/g, "-")}`;
+                    return (
+                      <div key={opt} className="form-check d-flex align-items-center">
+                        <input
+                          className="form-check-input"
+                          type="radio"
+                          name="j-trim"
+                          id={id}
+                          value={opt}
+                          checked={jTrimSelection === opt}
+                          onChange={() => setJTrimSelection(opt)}
+                          style={{ width: "1.25rem", height: "1.25rem", marginRight: "0.5rem", marginTop: 0, flexShrink: 0 }}
+                        />
+                        <label className="form-check-label" htmlFor={id}>
+                          {opt}
+                        </label>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </>)}
+
+            <SectionDivider />
+            {/* Storage — center storage (UI only, not wired to pricing/3D yet) */}
+            {!storageAdded ? (
+              <div className="mb-3">
+                <div className="text-muted small mb-2">Center Storage: none</div>
+                <button type="button" className="btn btn-outline-dark rounded-pill w-100 fw-semibold"
+                  onClick={() => { setStorageAdded(true); setStorageCollapsed(false); setStorageLocation("none"); setStorageDepth(9); setStorageOpenings({ ...EMPTY_STORAGE_OPENINGS }); }}>
+                  Add Storage
+                </button>
+              </div>
+            ) : (
+              <div className="mb-3 p-2 border rounded bg-light">
+                <div className="d-flex justify-content-between align-items-center mb-2">
+                  <div className="fw-semibold small d-flex align-items-center gap-1" style={{ cursor: "pointer" }}
+                    onClick={() => setStorageCollapsed((c) => !c)}
+                    title={storageCollapsed ? "Expand" : "Collapse"}>
+                    <AppIcon icon={storageCollapsed ? "chevron-down" : "chevron-up"} style={{ fontSize: 10 }} />
+                    Center Storage: {storageLocation}, {storageDepth}&apos; Storage Depth
+                  </div>
+                  <button className="btn btn-link btn-sm text-danger p-0"
+                    onClick={() => { setStorageAdded(false); setStorageLocation("none"); setStorageCollapsed(false); setStorageDepth(9); setStorageOpenings({ ...EMPTY_STORAGE_OPENINGS }); }}>
+                    Remove
+                  </button>
+                </div>
+
+                {!storageCollapsed && (
+                  <div>
+                    <div className="text-muted small mb-2">
+                      Location: {STORAGE_LOCATIONS.find((o) => o.value === storageLocation)?.label ?? "None"}
+                    </div>
+                    {STORAGE_LOCATIONS.map((o) => (
+                      <div className="form-check" key={o.value}>
+                        <input className="form-check-input" type="radio" name="storage-location" id={`storage-loc-${o.value}`}
+                          checked={storageLocation === o.value}
+                          onChange={() => { setStorageLocation(o.value); if (o.value === "none") setStorageOpenings({ ...EMPTY_STORAGE_OPENINGS }); }} />
+                        <label className="form-check-label" htmlFor={`storage-loc-${o.value}`}>{o.label}</label>
+                      </div>
+                    ))}
+
+                    {/* Depth — placeholder */}
+                    <div className="mb-2">
+                      <div className="text-muted small mb-1">Depth: {storageDepth}&apos;</div>
+                      <select className="form-select form-select-sm" value={storageDepth}
+                        onChange={(e) => setStorageDepth(Number(e.target.value))}>
+                        {STORAGE_DEPTHS.map((d) => <option key={d} value={d}>{d}&apos;</option>)}
+                      </select>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            <SectionDivider />
+            <div className="fw-semibold mb-2">Add or Edit Lean-to&apos;s</div>
+
+            {/* Visual wall picker — reference layout: Back over Front in the
+                middle column, Left and Right centered on either side. Plan
+                icon per side; "+" to add, pencil to edit an added lean-to. */}
+            {availableLeantoStyles.length > 0 && (() => {
+              const usedSides = new Set(leantos.map((x) => x.side_key));
+              const S = ({ sk, lb }) => {
+                const on = usedSides.has(sk);
+                return (
+                  <div
+                    className="psb-lts-side"
+                    data-side={sk}
+                    onClick={() => { if (on) { setActiveSection(sk); setLeantoFocusTick((t) => t + 1); } else { addLeanTo(sk); setLeantoFocusTick((t) => t + 1); } }}
+                    title={on ? `Edit ${lb} lean-to` : `Add ${lb} lean-to`}
+                  >
+                    <div className={`psb-lts-tile ${on ? "is-on" : ""}`}>
+                      <LeantoSideIcon side={sk} />
+                      <span className={`psb-lts-badge ${on ? "is-on" : ""}`}>
+                        <AppIcon icon={on ? "pen" : "plus"} style={{ fontSize: 10 }} />
+                      </span>
+                    </div>
+                    <div className="psb-lts-label">{lb}</div>
+                  </div>
+                );
+              };
+              return (
+                <div className="psb-lts-grid mb-2">
+                  <S sk="back" lb="Back" />
+                  <S sk="left" lb="Left" />
+                  <S sk="right" lb="Right" />
+                  <S sk="front" lb="Front" />
+                </div>
+              );
+            })()}
+
+            {leantos.length > 0 && <SectionDivider />}
+            {leantos.map((lt, ltIdx) => {
+              const sideLabel = (leantoSides ?? []).find((s) => s.side_key === lt.side_key)?.name ?? lt.side_key;
+              const isSide = lt.side_key === "left" || lt.side_key === "right";
+              const ltWidths = getLeantoWidths();
+              const ltHeights = getLeantoHeights();
+              const maxLen = isSide ? length : width;
+              const ltLengths = getLeantoLengths().filter((v) => v <= maxLen);
+              // If no configured length fits the side, the side's own length is
+              // the only feasible option.
+              if (ltLengths.length === 0) ltLengths.push(maxLen);
+              ltLengths.sort((a, b) => a - b);
+              const currentWallMode = lt.wallMode || "open";
+              const ltUi = leantoUiOptions[lt.side_key] ?? LT_UI_DEFAULTS;
+              // Normalize stale Wrap values (e.g. "None" from before the option rename) to the default
+              for (const wrapKey of ["wrapFront", "wrapBack", "wrapLeft", "wrapRight"]) {
+                if (!LT_WRAP_OPTIONS.includes(ltUi[wrapKey])) ltUi[wrapKey] = LT_UI_DEFAULTS[wrapKey];
+              }
+              // Normalize stale/absent pitch values to a DB-listed pitch option
+              if (!roofPitchOptions.some((p) => normalizePitchName(p) === normalizePitchName(ltUi.roofPitch))) ltUi.roofPitch = defaultPitchOption(roofPitchOptions) || ltUi.roofPitch;
+              // Normalize stale/absent Roof Style / Side Connection values to the defaults
+              if (!LT_ROOF_STYLE_OPTIONS.some((o) => o.value === ltUi.roofStyle)) ltUi.roofStyle = LT_UI_DEFAULTS.roofStyle;
+              if (!LT_CONNECTION_OPTIONS.some((o) => o.value === ltUi.sideConnection)) ltUi.sideConnection = LT_UI_DEFAULTS.sideConnection;
+              if (!STORAGE_DEPTHS.includes(ltUi.storageDepth)) ltUi.storageDepth = LT_UI_DEFAULTS.storageDepth;
+              const setLtUi = (patch) => updateLtUi(lt.side_key, patch);
+              const isLtCollapsed = !!collapsedLeantos[lt.side_key];
+              return (
+                <div key={lt.side_key} className="mb-3 p-2 border rounded bg-light" style={{ cursor: "pointer" }}
+                  onClick={() => { setActiveSection(lt.side_key); setLeantoFocusTick((t) => t + 1); }}>
+                  <div className="d-flex justify-content-between align-items-center mb-2">
+                    <div className="fw-semibold small d-flex align-items-center gap-1" style={{ cursor: "pointer" }}
+                      onClick={(e) => { e.stopPropagation(); toggleLeantoCollapsed(lt.side_key); }}
+                      title={isLtCollapsed ? "Expand" : "Collapse"}>
+                      <AppIcon icon={isLtCollapsed ? "chevron-down" : "chevron-up"} style={{ fontSize: 10 }} />
+                      {sideLabel} Lean-To
+                    </div>
+                    <button className="btn btn-link btn-sm text-danger p-0" onClick={(e) => { e.stopPropagation(); removeLeanTo(lt.side_key); }}>Remove</button>
+                  </div>
+
+                  {!isLtCollapsed && (<>
+                  {/* Lean-to style selector */}
+                  {availableLeantoStyles.length > 1 && (
+                    <div className="mb-2">
+                      <div className="d-flex gap-1 flex-wrap">
+                        {availableLeantoStyles.map((s) => (
+                          <button key={s.leanto_style_id}
+                            className={`btn btn-sm ${lt.leanto_style_id === s.leanto_style_id ? "btn-dark" : "btn-outline-secondary"}`}
+                            style={{ fontSize: 11 }}
+                            onClick={() => setLeantos((prev) => prev.map((item, i) => i === ltIdx ? {
+                              ...item,
+                              leanto_style_id: s.leanto_style_id,
+                              render_key: s.render_key,
+                              // "Enclosed Lean with Storage" is an enclosed
+                              // lean-to too (it adds an interior partition).
+                              wallMode: ["enclosed", "enclosed_with_storage"].includes(s.render_key) ? "enclosed" : "open",
+                              walls: applyLtWallMode(["enclosed", "enclosed_with_storage"].includes(s.render_key) ? "enclosed" : "open"),
+                              openings: String(s.render_key ?? "").includes("storage")
+                                ? item.openings
+                                : Object.fromEntries(Object.entries(item.openings || {}).filter(([key]) => key !== "storage_partition")),
+                            } : item))}>
+                            {s.name}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Wall mode */}
+                  <div className="mb-2">
+                    <label className="form-label small mb-1 fw-semibold">Walls</label>
+                    <div className="d-flex gap-1 flex-wrap">
+                      {LT_WALL_MODES.map((m) => (
+                        <button key={m.key}
+                          className={`btn btn-sm ${currentWallMode === m.key ? "btn-dark" : "btn-outline-secondary"}`}
+                          onClick={() => {
+                            const newWalls = applyLtWallMode(m.key);
+                            setLeantos((prev) => prev.map((item, i) => i === ltIdx ? {
+                              ...item,
+                              wallMode: m.key,
+                              ...(newWalls ? { walls: newWalls } : {}),
+                              // Preset modes drop any per-wall custom panels.
+                              ...(m.key !== "custom" ? { customWalls: {} } : {}),
+                            } : item));
+                          }}>
+                          {m.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Per-wall customization (only shown in custom mode) */}
+                  {currentWallMode === "custom" && (
+                    <div className="mb-2 ps-1">
+                  {/* Building-relative wall names. Side lean-to (left/right):
+                      left_end = front end (−Z), right_end = back end (+Z),
+                      outer = its side wall. End lean-to (front/back):
+                      outer = its end wall, left_end = left side (−X),
+                      right_end = right side (+X). Keys are unchanged. */}
+                      {(isSide ? ["left_end", "right_end", "outer"] : ["outer", "left_end", "right_end"]).map((wk) => {
+                        const wLabel = isSide
+                          ? (wk === "outer" ? `${lt.side_key === "left" ? "Left" : "Right"} Side Wall` : wk === "left_end" ? "Front End" : "Back End")
+                          : (wk === "outer" ? `${lt.side_key === "front" ? "Front" : "Back"} End` : wk === "left_end" ? "Left Side Wall" : "Right Side Wall");
+                        const wVal = lt.walls?.[wk] || "open";
+                        // Custom panel (same metal_m_panel_pricing Custom rows as
+                        // the center section): side-wall list for the outer wall,
+                        // end-wall list for the two ends.
+                        const customId = lt.customWalls?.[wk] ?? "";
+                        const sideLocType = (panelLocations ?? []).find((loc) => loc.location_type !== "end")?.location_type;
+                        const panelOpts = getCustomWallOptions({
+                          panelPricing,
+                          panelTypes,
+                          locationType: wk === "outer" ? sideLocType : "end",
+                        });
+                        const setWall = (wallValue, panelId) => setLeantos((prev) => prev.map((item, i) => {
+                          if (i !== ltIdx) return item;
+                          const nextCustom = { ...(item.customWalls ?? {}) };
+                          if (panelId == null) delete nextCustom[wk];
+                          else nextCustom[wk] = panelId;
+                          return { ...item, walls: { ...item.walls, [wk]: wallValue }, customWalls: nextCustom };
+                        }));
+                        return (
+                          <div key={wk} className="d-flex align-items-center gap-2 mb-1">
+                            <span className="small" style={{ width: 100 }}>{wLabel}</span>
+                            {["enclosed", "open"].map((opt) => (
+                              <button key={opt}
+                                className={`btn btn-sm py-0 px-2 ${customId === "" && wVal === opt ? "btn-dark" : "btn-outline-secondary"}`}
+                                onClick={() => setWall(opt, null)}>
+                                {opt === "enclosed" ? "Enclosed" : "Open"}
+                              </button>
+                            ))}
+                            <select
+                              className={`form-select form-select-sm py-0 ${customId !== "" ? "border-dark fw-semibold" : ""}`}
+                              style={{ width: 170, fontSize: 12 }}
+                              value={customId}
+                              onClick={(e) => e.stopPropagation()}
+                              onChange={(e) => {
+                                const v = e.target.value;
+                                if (v === "") { setWall("open", null); return; }
+                                const row = panelOpts.find((o) => String(o.panel_pricing_id) === v);
+                                if (!row) return;
+                                setWall(deriveCustomRenderType(row) || "open", row.panel_pricing_id);
+                              }}>
+                              <option value="">Panel…</option>
+                              {panelOpts.map((o) => (
+                                <option key={o.panel_pricing_id} value={o.panel_pricing_id}>{o.label}</option>
+                              ))}
+                            </select>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {/* Dimensions */}
+                  <div className="row g-2">
+                    <div className="col-4">
+                      <label className="form-label small mb-0">Width</label>
+                      <select className="form-select form-select-sm" value={lt.width_ft}
+                        onChange={(e) => setLeantos((prev) => prev.map((item, i) => i === ltIdx ? { ...item, width_ft: Number(e.target.value) } : item))}>
+                        {ltWidths.filter((v) => v < (isSide ? width : length)).map((w) => <option key={w} value={w}>{w}&apos;</option>)}
+                      </select>
+                    </div>
+                    <div className="col-4">
+                      <label className="form-label small mb-0">Length</label>
+                      <select className="form-select form-select-sm" value={lt.length_ft}
+                        onChange={(e) => setLeantos((prev) => prev.map((item, i) => i === ltIdx ? { ...item, length_ft: Number(e.target.value) } : item))}>
+                        {ltLengths.map((v) => <option key={v} value={v}>{v}&apos;</option>)}
+                      </select>
+                    </div>
+                    <div className="col-4">
+                      <label className="form-label small mb-0">Leg Height</label>
+                      <select className="form-select form-select-sm" value={lt.height_ft}
+                        onChange={(e) => setLeantos((prev) => prev.map((item, i) => i === ltIdx ? { ...item, height_ft: Number(e.target.value) } : item))}>
+                        {ltHeights.filter((v) => v < height).map((h) => <option key={h} value={h}>{h}&apos;</option>)}
+                      </select>
+                    </div>
+                  </div>
+
+                  {/* ── Feature options ── */}
+                  <div onClick={(e) => e.stopPropagation()}>
+                    <SectionDivider />
+                    {/* Roof Pitch */}
+                    <LtRadioGroup sideKey={lt.side_key} field="roof-pitch" label="Roof Pitch" value={ltUi.roofPitch}
+                      options={roofPitchOptions} onChange={(v) => setLtUi({ roofPitch: v })} />
+
+                    <SectionDivider />
+                    {/* Corner wraps -- Standard Roofline extends the roof past
+                        the corner and wraps the edge trim around it */}
+                    {(() => {
+                      const isSideLean = lt.side_key === "left" || lt.side_key === "right";
+                      const leanName = LT_SIDE_SHORT_NAMES[lt.side_key] ?? "Lean";
+                      const wrapGroup = (corner, key, field) => (
+                        <LtRadioGroup sideKey={lt.side_key} field={field}
+                          label={"Wrap " + leanName + " around " + corner + " Corner"} value={ltUi[key]}
+                          options={LT_WRAP_OPTIONS} onChange={(v) => setLtUi({ [key]: v })} />
+                      );
+                      return isSideLean ? (
+                        <>{wrapGroup("Front", "wrapFront", "wrap-front")}{wrapGroup("Back", "wrapBack", "wrap-back")}</>
+                      ) : (
+                        <>{wrapGroup("Left", "wrapLeft", "wrap-left")}{wrapGroup("Right", "wrapRight", "wrap-right")}</>
+                      );
+                    })()}
+
+                    <SectionDivider />
+                    {/* Roof Style — priced from the Roof Style matrix by lean-to size */}
+                    <LtRadioGroup sideKey={lt.side_key} field="roof-style" label="Roof Style" value={ltUi.roofStyle}
+                      options={LT_ROOF_STYLE_OPTIONS} onChange={(v) => setLtUi({ roofStyle: v })} />
+
+                    <SectionDivider />
+                    {/* Side Connection — priced from the DB "Connection Fee" option (by length + region) */}
+                    <LtRadioGroup sideKey={lt.side_key} field="side-connection" label="Side Connection" value={ltUi.sideConnection}
+                      options={LT_CONNECTION_OPTIONS.map((o) => ({
+                        value: o.value,
+                        label: o.value === "standard" && Number(leantoConnectionFees[lt.side_key] ?? 0) > 0 ? `${o.label} (+${formatCurrency(leantoConnectionFees[lt.side_key])})` : o.label,
+                      }))}
+                      onChange={(v) => setLtUi({ sideConnection: v })} />
+
+                    {/* Storage Depth — "Enclosed Lean with Storage" only. The
+                        interior partition renders this deep from the lean-to's
+                        front end (same depth behavior as Center Storage). */}
+                    {String(lt.render_key ?? "").includes("storage") && (<>
+                      <SectionDivider />
+                      <div className="mb-2">
+                        <label className="form-label small mb-1 fw-semibold">Storage Depth</label>
+                        <select className="form-select form-select-sm" value={ltUi.storageDepth}
+                          onChange={(e) => setLtUi({ storageDepth: Number(e.target.value) })}>
+                          {STORAGE_DEPTHS.map((d) => <option key={d} value={d}>{d}&apos;</option>)}
+                        </select>
+                      </div>
+                    </>)}
+                  </div>
+                  </>)}
+                </div>
+              );
+            })}
+
+            {availableLeantoStyles.length > 0 && leantos.length < (leantoSides ?? []).length && (
+              <div className="text-muted small text-center mt-1">Click a side above to add or remove a lean-to.</div>
+            )}
+          </div>
+        )}
+
+        {/* ─── TAB: OPENINGS (Section → Wall → Items) ─── */}
+        {rightPanelMode === "openings" && (
+          <div className="p-3">
+            <div className="fw-bold mb-1">Doors &amp; Windows</div>
+            <p className="text-muted small mb-2">
+              Add items using the buttons below. Then, select the item on the wall to change its style, size, or features.
+            </p>
+
+            <SectionDivider />
+            {/* Section selector */}
+            <div className="mb-3">
+              <div className="fw-semibold small mb-1">Section</div>
+              <div className="d-flex gap-1 flex-wrap">
+                {sections.map((sec) => (
+                  <button key={sec.key}
+                    className={`btn btn-sm ${activeSection === sec.key ? "btn-dark" : "btn-outline-secondary"}`}
+                    onClick={() => changeSection(sec.key)}>
+                    {sec.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <SectionDivider />
+            {/* Wall selector */}
+            <div className="mb-3">
+              <div className="fw-semibold small mb-1">Wall</div>
+              <div className="d-flex gap-1">
+                {wallsForSection.map((w) => {
+                  const isOpen = activeSection === "center" && walls3d[w.key] === false;
+                  return (
+                    <button key={w.key}
+                      className={`btn btn-sm flex-fill ${activeWall === w.key ? "btn-dark" : isOpen ? "btn-outline-secondary opacity-50" : "btn-outline-secondary"}`}
+                      onClick={() => setActiveWall(w.key)}>
+                      {w.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Guard: wall is open — no items allowed */}
+            {activeSection === "center" && walls3d[activeWall] === false ? (
+              <div className="alert alert-secondary small py-2">
+                This wall is open. Change the wall mode in the <strong>Building</strong> tab to add items.
+              </div>
+            ) : (
+            <>
+            {/* Constraint warning */}
+            {constraintWarning && (
+              <div className="alert alert-warning small py-2 d-flex align-items-start gap-2 mb-2" role="alert">
+                <AppIcon icon="ban" className="mt-1 text-warning" />
+                <div>
+                  <strong>Can&apos;t add:</strong> {constraintWarning}
+                  <button className="btn btn-link btn-sm p-0 ms-2 text-muted" onClick={() => setConstraintWarning(null)}>dismiss</button>
+                </div>
+              </div>
+            )}
+            <SectionDivider />
+            {/* Add Items to Wall — IdeaRoom-style icon cards */}
+            <div className="mb-3">
+              <div className="fw-semibold small mb-2">Add Items to Wall</div>
+              <div className="d-flex flex-wrap gap-2">
+                {itemTypes.map((type) => {
+                  if (!isAccessoryAllowed(styleProfile, type)) return null;
+                  const items = doorWindowItems.filter((i) => resolveOpeningType(i) === type);
+                  if (items.length === 0) return null;
+                  const label = type === "rollup_door" ? "Rollup Door" : type.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+                  return (
+                    <ItemCard key={type} type={type} label={label} items={items} onAdd={addItemToWall} />
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Items on current wall */}
+            {currentWallItems.length > 0 && <SectionDivider />}
+            {currentWallItems.length > 0 && (
+              <div className="mb-3">
+                <div className="fw-semibold small mb-1">Items on wall ({currentWallItems.length})</div>
+                {currentWallItems.map((item, idx) => {
+                  const wallW = getWallWidthFt(activeWall, activeSection, width, length, leantos, storageConfig);
+                  const wallH = getWallHeightFt(activeSection, height, leantos, activeWall);
+                  const dims = parseItemDimensions(item.name);
+                  const tooWide = dims && dims.widthFt > wallW - FRAME_CLEARANCE_FT * 2;
+                  const tooTall = dims && dims.heightFt > wallH - HEIGHT_CLEARANCE_FT;
+                  const hasViolation = tooWide || tooTall;
+                  const isEditing = editingItemIdx === idx;
+                  const dbItem = isEditing
+                    ? doorWindowItems.find(i => String(i.item_id) === String(item.item_id))
+                      ?? legacyDoorWindowItems.find(i => String(i.item_id) === String(item.item_id))
+                    : null;
+                  const isLegacyWindow = dbItem && resolveOpeningType(dbItem) === "window"
+                    && !doorWindowItems.some(i => String(i.item_id) === String(item.item_id));
+                  const variants = isEditing && dbItem
+                    ? [...(isLegacyWindow ? [dbItem] : []), ...doorWindowItems.filter(i => resolveOpeningType(i) === resolveOpeningType(dbItem))]
+                    : [];
+                  return (
+                  <div key={idx} className="mb-1">
+                    <div
+                      className={`d-flex justify-content-between align-items-center py-1 ps-2 border-start border-3 ${hasViolation ? "border-danger" : "border-primary"}`}
+                      style={{ background: selectedOpening?.wall === activeWall && selectedOpening?.idx === idx ? "#e9f0fb" : hasViolation ? "#fff5f5" : undefined, cursor: "pointer" }}
+                      onClick={() => setSelectedOpening({ wall: activeWall, idx })}
+                      title={hasViolation ? `⚠ ${tooWide ? "Too wide" : "Too tall"} for this wall — remove or resize the building` : ""}>
+                      <span className="small">{hasViolation && <AppIcon icon="ban" className="text-danger me-1" style={{ fontSize: 10 }} />}{item.name}</span>
+                      <div className="d-flex align-items-center gap-3">
+                        <AppIcon icon="pen" className={isEditing ? "text-primary" : "text-muted"} style={{ fontSize: 14, cursor: "pointer", padding: 2 }} onClick={() => setEditingItemIdx(isEditing ? null : idx)} />
+                        <AppIcon icon="copy" className="text-muted" style={{ fontSize: 14, cursor: "pointer", padding: 2 }} onClick={() => duplicateItemOnWall(idx)} title="Duplicate" />
+                        <AppIcon icon="trash" className="text-danger" style={{ fontSize: 14, cursor: "pointer", padding: 2 }} onClick={() => removeItemFromWall(idx)} />
+                      </div>
+                    </div>
+                    {isEditing && variants.length > 0 && (
+                      <div className="ps-3 py-1" style={{ background: "#f8f9fa", borderRadius: "0 0 4px 4px" }}>
+                        <select className="form-select form-select-sm" value={item.item_id}
+                          onChange={(e) => {
+                            const variant = doorWindowItems.find(i => String(i.item_id) === e.target.value) ?? legacyDoorWindowItems.find(i => String(i.item_id) === e.target.value);
+                            if (variant) { replaceItemOnWall(idx, variant); setEditingItemIdx(null); }
+                          }}>
+                          {variants.map((v) => <option key={v.item_id} value={v.item_id}>{v.name} — ${v.price}</option>)}
+                        </select>
+                        {constraintWarning && (
+                          <div className="text-warning small mt-1"><AppIcon icon="ban" className="me-1" />{constraintWarning}</div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Total removed — shown only in quote modal */}
+            </>
+            )}
+          </div>
+        )}
+
+        {/* ─── TAB: COLORS (Colors + Siding) ────────── */}
+        {rightPanelMode === "colors" && (
+          <div className="p-3">
+            <div className="fw-semibold mb-2">Colors</div>
+            <p className="psb-color-note mb-3">Actual colors may vary slightly from the screen color shown. Contact us for a sample.</p>
+            {colorGroups.filter((group) => isColorGroupVisible(group, walls3d)).map((group) => {
+              const groupOpts = colorOptions.filter((o) => o.color_group_id === group.color_group_id);
+              const selectedOptId = colorSelections[group.color_group_id];
+              const selectedOpt = resolveSelectedColorOption(groupOpts, group.color_group_id, selectedOptId);
+              const displayOpts = selectedOpt && !groupOpts.some((o) => o.color_option_id === selectedOpt.color_option_id)
+                ? [selectedOpt, ...groupOpts]
+                : groupOpts;
+              return (
+                <div key={group.color_group_id} className="mb-4">
+                  <div className="psb-color-group-title">{group.name}</div>
+                  <div className="psb-color-selected-label mb-2">
+                    <span className="fw-semibold">Selected:</span>{" "}
+                    {selectedOpt ? formatColorLabel(selectedOpt.name, selectedOpt.upcharge) : "None"}
+                  </div>
+                  <div className="psb-color-grid">
+                    {displayOpts.map((opt) => (
+                      <div key={opt.color_option_id} className="psb-color-cell">
+                        <div
+                          className={`psb-color-swatch${selectedOptId === opt.color_option_id ? " is-selected" : ""}`}
+                          data-name={formatColorLabel(opt.name, opt.upcharge)}
+                          aria-label={formatColorLabel(opt.name, opt.upcharge)}
+                          role="button"
+                          style={{ background: opt.hex_code }}
+                          onClick={() => setColorSelections((prev) => ({ ...prev, [group.color_group_id]: opt.color_option_id }))}
+                        />
+                        <div className="psb-color-price">{formatUpcharge(opt.upcharge)}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+
+            {colorUpchargeTotal > 0 && (
+              <div className="mt-2 text-end border-top pt-2">
+                <span className="text-muted small">Color upcharges: </span>
+                <span className="fw-bold">{formatCurrency(colorUpchargeTotal)}</span>
+              </div>
+            )}
+
+            {sidingFeature && (
+              <>
+                <SectionDivider />
+                <div className="fw-semibold mb-2 mt-3">Siding Direction</div>
+                <select className="form-select form-select-sm"
+                  value={sidingOptionId ?? ""} onChange={(e) => changeSidingOption(e.target.value ? Number(e.target.value) : null)}>
+                  <option value="">Default</option>
+                  {sidingOptions.map((o) => (
+                    <option key={o.option_id} value={o.option_id}>{o.name}</option>
+                  ))}
+                </select>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* ─── TAB: MATERIALS (Add-Ons) ────────── */}
+        {rightPanelMode === "materials" && (
+          <div className="p-3">
+            {materialSectionFeatures.length === 0 && <p className="text-muted small">No add-on features available for this style.</p>}
+            {materialSectionFeatures.map((feat, idx) => (
+              <div key={feat.feature_id}>
+                {idx > 0 && <SectionDivider />}
+                {String(feat.name ?? "").trim().toLowerCase().replace(/\s+/g, " ") === "extra sheets metal" ? (
+                  /* Extra Sheets Metal — checkboxes + number of sheets (price × qty) */
+                  <QuantityMultiSelector feature={{ ...feat, description: featureSubtext(feat) }} options={options}
+                    addOnItems={addOnItems} updateAddOn={updateAddOn} />
+                ) : (
+                  <FeatureSelector feature={feat} options={options} framings={framings}
+                    rates={rates} addOnItems={addOnItems} updateAddOn={updateAddOn}
+                    width={width} length={length} panelLocations={panelLocations}
+                    onFramingChange={handleFrameGaugeChange} />
+                )}
+                {/* Panel Upgrade Scope — only for a non-standard upgrade */}
+                {isPanelUpgradeFeature(feat) && showPanelUpgradeScope && (<>
+                  <SectionDivider />
+                  <div className="mb-3">
+                    <div className="fw-semibold mb-1">Panel Upgrade Scope</div>
+                    <div className="d-flex flex-column gap-1">
+                      {PANEL_UPGRADE_SCOPES.map((s) => {
+                        const id = `panel-upgrade-scope-${s.toLowerCase().replace(/\s+/g, "-")}`;
+                        return (
+                          <div key={s} className="form-check d-flex align-items-center">
+                            <input className="form-check-input" type="radio" name="panel-upgrade-scope" id={id}
+                              checked={panelUpgradeScope === s} onChange={() => setPanelUpgradeScope(s)}
+                              style={{ width: "1.25rem", height: "1.25rem", marginRight: "0.5rem", marginTop: 0, flexShrink: 0 }} />
+                            <label className="form-check-label" htmlFor={id}>{s}</label>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </>)}
+                {/* Insulation areas — per section: roof + walls that aren't open */}
+                {String(feat.name ?? "").trim().toLowerCase().replace(/\s+/g, " ") === "insulation material" && showInsulationAreas && (<>
+                  <SectionDivider />
+                  {insulationSections.map((s) => (
+                    <div key={s.key} className="mb-3">
+                      <div className="fw-semibold mb-1">{s.title}:</div>
+                      <div className="d-flex flex-column gap-1">
+                        {s.areas.map((a) => {
+                          const k = `${s.key}:${a.key}`;
+                          const id = `ins-${s.key}-${a.key}`;
+                          return (
+                            <div key={k} className="form-check d-flex align-items-center">
+                              <input className="form-check-input" type="checkbox" id={id}
+                                checked={!!insulationAreas[k]}
+                                onChange={(e) => setInsulationAreas((prev) => ({ ...prev, [k]: e.target.checked }))}
+                                style={{ width: "1.25rem", height: "1.25rem", marginRight: "0.5rem", marginTop: 0, flexShrink: 0 }} />
+                              <label className="form-check-label" htmlFor={id}>{a.label} - Insulation</label>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </>)}
+              </div>
+            ))}
+            {/* Brackets — checkbox + Qty, price by delivery region (default = no region mapping) */}
+            {bracketFeature && bracketOptions.length > 0 && (<>
+              {materialSectionFeatures.length > 0 && <SectionDivider />}
+              <QuantityMultiSelector feature={{ ...bracketFeature, name: "Brackets", description: featureSubtext(bracketFeature) }}
+                options={bracketOptions} addOnItems={addOnItems} updateAddOn={updateAddOn} qtyLabel="Qty" />
+            </>)}
+            {/* Anchors — checkbox + Qty, matched to Installation Surface, price by delivery region */}
+            {anchorFeature && anchorOptions.length > 0 && (<>
+              {(materialSectionFeatures.length > 0 || (bracketFeature && bracketOptions.length > 0)) && <SectionDivider />}
+              <QuantityMultiSelector feature={{ ...anchorFeature, name: "Anchors", description: "" }}
+                options={anchorOptions} addOnItems={addOnItems} updateAddOn={updateAddOn} qtyLabel="Qty" />
+            </>)}
+            {/* Foam Enclosure Package — single checkbox, size-band price */}
+            {foamEnclosureFeature && (<>
+              {(materialSectionFeatures.length > 0 || bracketOptions.length > 0 || anchorOptions.length > 0) && <SectionDivider />}
+              <SingleQtyOption title="Foam Enclosure" feature={foamEnclosureFeature} option={foamEnclosureOption}
+                itemKey={foamEnclosureKey} addOnItems={addOnItems} updateAddOn={updateAddOn} showQty={false}
+                unavailableText={`No Foam Enclosure price is set for a ${width}' x ${length}' x ${height}' building.`} />
+            </>)}
+            {/* Extra Bows — Commercial only; width-band price × qty */}
+            {isCommercialStyle && trussBowFeature && (<>
+              {materialSectionFeatures.length > 0 && <SectionDivider />}
+              <SingleQtyOption title="Extra Bows" feature={trussBowFeature} option={trussBowOption}
+                itemKey={trussBowKey} addOnItems={addOnItems} updateAddOn={updateAddOn}
+                unavailableText={`No Extra Truss Bows price is set for a ${width}' wide building.`} />
+            </>)}
+          </div>
+        )}
+
+{/* ─── TAB: SALES TOOL ───────────────────────── */}
+        {rightPanelMode === "salestax" && (
+          <div className="p-3">
+            {/* DISCOUNTS & ADJUSTMENTS */}
+            <div className="fw-semibold text-uppercase text-muted small mb-2">Discounts & Adjustments</div>
+
+            <SectionDivider />
+            {/* Custom Adjustments (metal_s_custom_adjustment types) */}
+            <CustomAdjustmentsSection types={customAdjustmentTypes} rows={customAdjustments}
+              setRows={setCustomAdjustments} calc={customAdjustmentCalc} />
+
+            <SectionDivider />
+            {/* Deposits */}
+            <div className="mb-3">
+              <div className="fw-semibold mb-2">Deposits</div>
+
+              <div className="d-flex flex-column gap-2">
+                {/* Standard (no deposit) */}
+                <div className="form-check d-flex align-items-center">
+                  <input
+                    className="form-check-input"
+                    type="radio"
+                    name="depositMode"
+                    id="depositStandard"
+                    value="standard"
+                    checked={depositMode === "standard"}
+                    onChange={() => setDepositMode("standard")}
+                    style={{ width: "1.25rem", height: "1.25rem", marginRight: "0.5rem", marginTop: 0, flexShrink: 0 }}
+                  />
+                  <label className="form-check-label" htmlFor="depositStandard">
+                    Standard
+                  </label>
+                </div>
+
+                {/* Custom Amount */}
+                <div className="form-check d-flex align-items-center">
+                  <input
+                    className="form-check-input"
+                    type="radio"
+                    name="depositMode"
+                    id="depositCustomAmount"
+                    value="customAmount"
+                    checked={depositMode === "customAmount"}
+                    onChange={() => setDepositMode("customAmount")}
+                    style={{ width: "1.25rem", height: "1.25rem", marginRight: "0.5rem", marginTop: 0, flexShrink: 0 }}
+                  />
+                  <label className="form-check-label w-100" htmlFor="depositCustomAmount">
+                    Custom Amount
+                  </label>
+                </div>
+                {depositMode === "customAmount" && (
+                  <div className="input-group input-group-sm mb-2">
+                    <span className="input-group-text">$</span>
+                    <input
+                      type="number"
+                      className="form-control"
+                      min="0"
+                      step="0.01"
+                      value={customDepositAmount}
+                      onChange={(e) => setCustomDepositAmount(Math.max(0, Number(e.target.value)))}
+                    />
+                  </div>
+                )}
+
+                {/* Custom Percentage */}
+                <div className="form-check d-flex align-items-center">
+                  <input
+                    className="form-check-input"
+                    type="radio"
+                    name="depositMode"
+                    id="depositCustomPercentage"
+                    value="customPercentage"
+                    checked={depositMode === "customPercentage"}
+                    onChange={() => setDepositMode("customPercentage")}
+                    style={{ width: "1.25rem", height: "1.25rem", marginRight: "0.5rem", marginTop: 0, flexShrink: 0 }}
+                  />
+                  <label className="form-check-label w-100" htmlFor="depositCustomPercentage">
+                    Custom Percentage
+                  </label>
+                </div>
+                {depositMode === "customPercentage" && (
+                  <div className="input-group input-group-sm mb-2">
+                    <input
+                      type="number"
+                      className="form-control"
+                      min="0"
+                      max="100"
+                      step="0.01"
+                      value={customDepositPercentage}
+                      onChange={(e) => setCustomDepositPercentage(Math.max(0, Math.min(100, Number(e.target.value))))}
+                    />
+                    <span className="input-group-text">%</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Deposit Amount Display */}
+              <div className="d-flex justify-content-between align-items-center mt-3 pt-3 border-top">
+                <span className="fw-bold">Deposit Amount:</span>
+                <span className="fw-bold fs-5 text-primary">{formatCurrency(computedDepositAmount)}</span>
+              </div>
+            </div>
+
+            <SectionDivider />
+            {/* Dealer Deposit Discount */}
+            <div className="mb-3">
+              <div className="fw-semibold mb-2">Dealer Deposit Discount</div>
+
+              <div className="d-flex flex-column gap-2">
+                {/* Deposit Discount Amount */}
+                <div className="form-check d-flex align-items-center">
+                  <input
+                    className="form-check-input"
+                    type="radio"
+                    name="dealerDiscountMode"
+                    id="dealerDiscountAmount"
+                    value="amount"
+                    checked={dealerDiscountMode === "amount"}
+                    onChange={() => setDealerDiscountMode("amount")}
+                    style={{ width: "1.25rem", height: "1.25rem", marginRight: "0.5rem", marginTop: 0, flexShrink: 0 }}
+                  />
+                  <label className="form-check-label w-100" htmlFor="dealerDiscountAmount">
+                    Deposit Discount Amount
+                  </label>
+                </div>
+                {dealerDiscountMode === "amount" && (
+                  <div className="input-group input-group-sm mb-2">
+                    <span className="input-group-text">$</span>
+                    <input
+                      type="number"
+                      className={`form-control ${isDealerDiscountInvalid ? "is-invalid" : ""}`}
+                      min="0"
+                      step="0.01"
+                      value={dealerDiscountAmount}
+                      onChange={(e) => setDealerDiscountAmount(Math.max(0, Number(e.target.value)))}
+                    />
+                  </div>
+                )}
+                {isDealerDiscountInvalid && dealerDiscountMode === "amount" && (
+                  <div className="text-danger small mb-2">
+                    Dealer Discount cannot exceed the deposit amount
+                  </div>
+                )}
+
+                {/* Deposit Discount Percentage */}
+                <div className="form-check d-flex align-items-center">
+                  <input
+                    className="form-check-input"
+                    type="radio"
+                    name="dealerDiscountMode"
+                    id="dealerDiscountPercentage"
+                    value="percentage"
+                    checked={dealerDiscountMode === "percentage"}
+                    onChange={() => setDealerDiscountMode("percentage")}
+                    style={{ width: "1.25rem", height: "1.25rem", marginRight: "0.5rem", marginTop: 0, flexShrink: 0 }}
+                  />
+                  <label className="form-check-label w-100" htmlFor="dealerDiscountPercentage">
+                    Deposit Discount Percentage
+                  </label>
+                </div>
+                {dealerDiscountMode === "percentage" && (
+                  <div className="input-group input-group-sm mb-2">
+                    <input
+                      type="number"
+                      className={`form-control ${isDealerDiscountInvalid ? "is-invalid" : ""}`}
+                      min="0"
+                      max="100"
+                      step="0.01"
+                      value={dealerDiscountPercentage}
+                      onChange={(e) => setDealerDiscountPercentage(Math.max(0, Math.min(100, Number(e.target.value))))}
+                    />
+                    <span className="input-group-text">%</span>
+                  </div>
+                )}
+                {isDealerDiscountInvalid && dealerDiscountMode === "percentage" && (
+                  <div className="text-danger small mb-2">
+                    Dealer Discount cannot exceed the deposit amount
+                  </div>
+                )}
+              </div>
+
+              {/* Dealer Discount Amount Display */}
+              <div className="d-flex justify-content-between align-items-center mt-3 pt-3 border-top">
+                <span className="fw-bold">Deposit Discount Amount:</span>
+                <span className="fw-bold fs-5 text-primary">{formatCurrency(computedDealerDiscount)}</span>
+              </div>
+            </div>
+
+            <SectionDivider />
+            {/* Sales Tax */}
+            <div className="mb-3">
+              <div className="fw-semibold mb-2">Sales Tax</div>
+
+              <div className="d-flex flex-column gap-2">
+                {/* Standard */}
+                <div className="form-check d-flex align-items-center">
+                  <input
+                    className="form-check-input"
+                    type="radio"
+                    name="salesTaxMode"
+                    id="salesTaxStandard"
+                    value="standard"
+                    checked={salesTaxMode === "standard"}
+                    onChange={() => setSalesTaxMode("standard")}
+                    style={{ width: "1.25rem", height: "1.25rem", marginRight: "0.5rem", marginTop: 0, flexShrink: 0 }}
+                  />
+                  <label className="form-check-label w-100" htmlFor="salesTaxStandard">
+                    Standard ({(salesTaxRate * 100).toFixed(2)}%)
+                  </label>
+                </div>
+
+                {/* Exempt */}
+                <div className="form-check d-flex align-items-center">
+                  <input
+                    className="form-check-input"
+                    type="radio"
+                    name="salesTaxMode"
+                    id="salesTaxExempt"
+                    value="exempt"
+                    checked={salesTaxMode === "exempt"}
+                    onChange={() => setSalesTaxMode("exempt")}
+                    style={{ width: "1.25rem", height: "1.25rem", marginRight: "0.5rem", marginTop: 0, flexShrink: 0 }}
+                  />
+                  <label className="form-check-label w-100" htmlFor="salesTaxExempt">
+                    Exempt
+                  </label>
+                </div>
+
+                {/* Percentage */}
+                <div className="form-check d-flex align-items-center">
+                  <input
+                    className="form-check-input"
+                    type="radio"
+                    name="salesTaxMode"
+                    id="salesTaxPercentage"
+                    value="percentage"
+                    checked={salesTaxMode === "percentage"}
+                    onChange={() => setSalesTaxMode("percentage")}
+                    style={{ width: "1.25rem", height: "1.25rem", marginRight: "0.5rem", marginTop: 0, flexShrink: 0 }}
+                  />
+                  <label className="form-check-label w-100" htmlFor="salesTaxPercentage">
+                    Percentage
+                  </label>
+                </div>
+                {salesTaxMode === "percentage" && (
+                  <div className="input-group input-group-sm mb-2">
+                    <input
+                      type="number"
+                      className="form-control"
+                      min="0"
+                      max="100"
+                      step="0.01"
+                      value={customTaxPercentage}
+                      onChange={(e) => setCustomTaxPercentage(Math.max(0, Math.min(100, Number(e.target.value))))}
+                    />
+                    <span className="input-group-text">%</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Sales Tax Amount Display */}
+              <div className="d-flex justify-content-between align-items-center mt-3 pt-3 border-top">
+                <span className="fw-bold">Sales Tax:</span>
+                <span className="fw-bold fs-5 text-primary">{formatCurrency(computedSalesTaxAmount)}</span>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ─── TAB: SERVICES, FINANCING & WARRANTY ─── */}
+        {rightPanelMode === "services" && (
+          <div className="p-3">
+            {/* Other Fees — moved here from Materials; checkboxes so any
+                combination of fees can be picked (each priced separately). */}
+            {otherFeesFeatures.map((feat, idx) => (
+              <div key={feat.feature_id}>
+                {idx > 0 && <SectionDivider />}
+                <MultiFixedSelector feature={{ ...feat, description: featureSubtext(feat) }} options={options}
+                  addOnItems={addOnItems} updateAddOn={updateAddOn} />
+              </div>
+            ))}
+            {otherFeesFeatures.length > 0 && <SectionDivider />}
+            <div className="text-muted text-center py-5">
+              Financing and warranty options coming soon.
+            </div>
+          </div>
+        )}
+</div>
+
+        {/* ─── FOOTER: Running Total ────────────────────────────────── */}
+        <div className="psb-config-footer p-3" style={{ flexShrink: 0 }}>
+          <div className="d-flex justify-content-between align-items-center">
+            <span className="small text-muted">Subtotal</span>
+            <span className="fw-semibold">{formatCurrency(grandTotal)}</span>
+          </div>
+          {customAdjustmentCalc.discount > 0 && (
+            <div className="d-flex justify-content-between align-items-center">
+              <span className="small text-muted">Discounts</span>
+              <span className="fw-semibold">-{formatCurrency(customAdjustmentCalc.discount)}</span>
+            </div>
+          )}
+          {(customAdjustmentCalc.taxable + customAdjustmentCalc.nonTaxable) > 0 && (
+            <div className="d-flex justify-content-between align-items-center">
+              <span className="small text-muted">Additional Items</span>
+              <span className="fw-semibold">{formatCurrency(customAdjustmentCalc.taxable + customAdjustmentCalc.nonTaxable)}</span>
+            </div>
+          )}
+          {effectiveTaxRate > 0 && (
+            <div className="d-flex justify-content-between align-items-center">
+              <span className="small text-muted">
+                Est. Tax ({(effectiveTaxRate * 100).toFixed(2)}%)
+              </span>
+              <span className="fw-semibold">
+                {formatCurrency(computedSalesTaxAmount)}
+              </span>
+            </div>
+          )}
+
+          {(() => {
+            const totalEstimate = adjustedSubtotal + computedSalesTaxAmount;
+            const showDepositBreakdown = depositMode !== "standard" && computedDepositAmount > 0;
+            return (
+              <>
+                <div className="d-flex justify-content-between align-items-center mb-2 mt-1">
+                  <span className="fw-bold fs-6">Total Estimate</span>
+                  <span className="fw-bold fs-5 psb-config-total">
+                    {formatCurrency(totalEstimate)}
+                  </span>
+                </div>
+                {showDepositBreakdown && (
+                  <>
+                    <div className="d-flex justify-content-between align-items-center">
+                      <span className="fw-bold fs-6">Due Today</span>
+                      <span className="fw-bold fs-5 psb-config-total">
+                        {formatCurrency(computedDepositAmount)}
+                      </span>
+                    </div>
+                    {computedDealerDiscount > 0 && (
+                      <div className="d-flex justify-content-between align-items-center">
+                        <span className="small text-muted">Deposit Discounts</span>
+                        <span className="fw-semibold">-{formatCurrency(computedDealerDiscount)}</span>
+                      </div>
+                    )}
+                    <div className="d-flex justify-content-between align-items-center mb-2 mt-1">
+                      <span className="fw-bold fs-6">Deposit Amount Due Now</span>
+                      <span className="fw-bold fs-5 psb-config-total">
+                        {formatCurrency(depositAmountDueNow)}
+                      </span>
+                    </div>
+                    <div className="d-flex justify-content-between align-items-center mb-2 mt-1">
+                      <span className="fw-bold fs-6">Due upon delivery</span>
+                      <span className="fw-bold fs-5 psb-config-total">
+                        {formatCurrency(dueUponDeliveryAmount)}
+                      </span>
+                    </div>
+                  </>
+                )}
+              </>
+            );
+          })()}
+          <button
+            className="btn psb-config-cta w-100 fw-bold"
+            onClick={() => setShowEstimateDrawer(true)}
+            disabled={!zipUnlocked}
+          >
+            View Estimate Summary
+          </button>
+        </div>
+      </div>
+
+      {/* ═══ ESTIMATE DETAILS DRAWER ═══ */}
+      <EstimateDetailsDrawer
+        show={showEstimateDrawer}
+        onHide={() => setShowEstimateDrawer(false)}
+        estimate={estimate}
+        captureViews={captureViews}
+        hideZeroAmounts
+        width={RIGHT_PANEL_WIDTH}
+      />
+
+      {/* ═══ ZIP GATE MODAL ═══ */}
+      {/* Dismissible via the close button; while no ZIP is confirmed, closing
+          it locks the configurator content only (see zipLocked) — the app
+          header/navigation stays usable. */}
+      {showZipModal && (
+        <div className="position-fixed top-0 start-0 w-100 h-100 d-flex align-items-center justify-content-center" style={{ zIndex: 10000, background: "rgba(0,0,0,0.65)" }}>
+          {/* Backdrop click is ignored — use the close button to dismiss. */}
+          <div className="bg-white rounded-3 shadow-lg p-4 position-relative" style={{ maxWidth: 420, width: "90%" }} onClick={(e) => e.stopPropagation()}>
+            {/* Close button — dismisses the modal; the configurator content
+                stays locked until a ZIP is provided (see zipLocked). */}
+            <button
+              type="button"
+              className="btn-close position-absolute top-0 end-0 m-3"
+              aria-label="Close"
+              onClick={closeZipModal}
+              disabled={zipSubmitting}
+            />
+            <div className="text-center mb-3">
+              <AppIcon icon="map-marker-alt" className="fs-3 text-muted mb-2" />
+              <h5 className="fw-bold mb-1">Delivery Location</h5>
+              <p className="text-muted small mb-0">
+                Please enter the ZIP code where your custom building will be delivered.
+                Please note that the configurator is currently in testing mode. If there are any discrepancies,
+                Premium Steel Buildings reserves the right to adjust pricing or modify the order as needed.
+              </p>
+            </div>
+
+            <form onSubmit={submitZip}>
+              <div className="mb-3">
+               <br/>  <br/>
+                <input
+                  id="zipInput"
+                  type="text"
+                  inputMode="numeric"
+                  maxLength={5}
+                  autoComplete="postal-code"
+                  className={`form-control ${zipError ? "is-invalid" : ""}`}
+                  placeholder="Enter Your ZIP Code (e.g. 48084)"
+                  value={zipDraft}
+                  onChange={(e) => {
+                    const v = e.target.value.replace(/\D/g, "").slice(0, 5);
+                    setZipDraft(v);
+                    if (zipError) setZipError(null);
+                  }}
+                  autoFocus
+                />
+                {zipError && <div className="invalid-feedback d-block">{zipError}</div>}
+              </div>
+
+              <button
+                type="submit"
+                className="btn btn-dark w-100 py-2 fw-semibold"
+                disabled={zipSubmitting || zipDraft.length < 5}
+              >
+                {zipSubmitting ? "Looking up…" : "Continue"}
+              </button>
+              {zipNotFoundDigits && (
+                <button
+                  type="button"
+                  className="btn btn-outline-success w-100 py-2 fw-semibold mt-3"
+                  onClick={openAddZipModal}
+                  disabled={zipSubmitting}
+                >
+                  <AppIcon icon="plus" className="me-1" /> Add ZIP Code
+                </button>
+              )}
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ═══ ADD ZIP CODE MODAL ═══ */}
+      {/* Shown when the entered ZIP is missing from metal_s_zip_codes.
+          Step "form": details pre-filled from lookupZipDetailsAction (editable).
+          Step "confirm": read-only confirmation of the API data result
+          (merged with manual edits) before the row is saved. */}
+      {showAddZipModal && (
+        <div className="position-fixed top-0 start-0 w-100 h-100 d-flex align-items-center justify-content-center" style={{ zIndex: 10001, background: "rgba(0,0,0,0.65)" }}>
+          <div className="bg-white rounded-3 shadow-lg p-4" style={{ maxWidth: 460, width: "90%", maxHeight: "90vh", overflowY: "auto" }} onClick={(e) => e.stopPropagation()}>
+            <div className="text-center mb-3">
+              <AppIcon icon="map-marker-alt" className="fs-3 text-muted mb-2" />
+              <h5 className="fw-bold mb-1">{addZipStep === "confirm" ? "Confirm ZIP Code Details" : "Add ZIP Code"}</h5>
+              <p className="text-muted small mb-0">
+                {addZipStep === "confirm"
+                  ? "Please confirm the details below. The ZIP code will be added to the database and used for pricing and delivery."
+                  : "This ZIP code is not in our database yet. Review the details below (filled from the ZIP lookup API where available), then continue to confirm."}
+              </p>
+            </div>
+
+            {addZipLookupLoading && (
+              <div className="alert alert-info py-2 small mb-3">Looking up ZIP code details…</div>
+            )}
+            {addZipLookupNote && addZipStep === "form" && !addZipLookupLoading && (
+              <div className="alert alert-warning py-2 small mb-3">{addZipLookupNote}</div>
+            )}
+            {addZipError && (
+              <div className="alert alert-danger py-2 small mb-3">{addZipError}</div>
+            )}
+
+            {addZipStep === "form" ? (
+              <div>
+                <div className="mb-2">
+                  <label className="form-label small mb-0">ZIP Code <span className="text-danger">*</span></label>
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    maxLength={5}
+                    className="form-control form-control-sm"
+                    value={addZipDraft.zipCode}
+                    onChange={(e) => updateAddZipField("zipCode", e.target.value.replace(/\D/g, "").slice(0, 5))}
+                    disabled={addZipSaving}
+                  />
+                </div>
+                <div className="mb-2">
+                  <label className="form-label small mb-0">Region <span className="text-danger">*</span></label>
+                  <input
+                    type="text"
+                    className="form-control form-control-sm"
+                    value={addZipDraft.region}
+                    onChange={(e) => updateAddZipField("region", e.target.value)}
+                    placeholder="Region / State (e.g. Michigan)"
+                    disabled={addZipSaving}
+                  />
+                </div>
+                <div className="mb-2">
+                  <label className="form-label small mb-0">City</label>
+                  <input type="text" className="form-control form-control-sm" value={addZipDraft.city} onChange={(e) => updateAddZipField("city", e.target.value)} placeholder="City (optional)" disabled={addZipSaving} />
+                </div>
+                <div className="mb-2">
+                  <label className="form-label small mb-0">County</label>
+                  <input type="text" className="form-control form-control-sm" value={addZipDraft.county} onChange={(e) => updateAddZipField("county", e.target.value)} placeholder="County (optional)" disabled={addZipSaving} />
+                </div>
+                <div className="row g-2 mb-2">
+                  <div className="col">
+                    <label className="form-label small mb-0">Latitude</label>
+                    <input type="number" step="0.000001" className="form-control form-control-sm" value={addZipDraft.latitude} onChange={(e) => updateAddZipField("latitude", e.target.value)} placeholder="Optional" disabled={addZipSaving} />
+                  </div>
+                  <div className="col">
+                    <label className="form-label small mb-0">Longitude</label>
+                    <input type="number" step="0.000001" className="form-control form-control-sm" value={addZipDraft.longitude} onChange={(e) => updateAddZipField("longitude", e.target.value)} placeholder="Optional" disabled={addZipSaving} />
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="small">
+                {[
+                  { label: "ZIP Code", value: addZipDraft.zipCode, source: null },
+                  { label: "City", value: addZipDraft.city, source: addZipDraft.sources.city },
+                  { label: "County", value: addZipDraft.county, source: addZipDraft.sources.county },
+                  {
+                    label: "Region",
+                    value: addZipDraft.region
+                      ? (addZipDraft.stateCode ? `${addZipDraft.region} (${addZipDraft.stateCode})` : addZipDraft.region)
+                      : "",
+                    source: addZipDraft.sources.region,
+                  },
+                  { label: "Latitude", value: addZipDraft.latitude, source: addZipDraft.sources.latitude },
+                  { label: "Longitude", value: addZipDraft.longitude, source: addZipDraft.sources.longitude },
+                ].map((row) => (
+                  <div key={row.label} className="d-flex justify-content-between align-items-center border-bottom py-1 gap-3">
+                    <span className="text-muted">{row.label}</span>
+                    <span className="text-end">
+                      {row.value !== "" && row.value != null ? row.value : <span className="text-muted fst-italic">—</span>}
+                      {row.source && (
+                        <span className={`badge ms-2 ${row.source === "api" ? "text-bg-light border" : "text-bg-secondary"}`}>
+                          {row.source === "api" ? "from lookup API" : "manual entry"}
+                        </span>
+                      )}
+                    </span>
+                  </div>
+                ))}
+                <div className="text-muted fst-italic mt-2">
+                  Confirm these details to add this ZIP code to the database.
+                </div>
+              </div>
+            )}
+
+            <div className="d-flex justify-content-end gap-2 mt-3">
+              {addZipStep === "confirm" ? (
+                <>
+                  <button
+                    type="button"
+                    className="btn btn-outline-secondary btn-sm"
+                    onClick={() => { setAddZipStep("form"); setAddZipError(null); }}
+                    disabled={addZipSaving}
+                  >
+                    Back to Edit
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-success btn-sm px-3"
+                    onClick={confirmAddZip}
+                    disabled={addZipSaving}
+                  >
+                    {addZipSaving ? "Saving…" : "Confirm & Add"}
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    className="btn btn-outline-secondary btn-sm"
+                    onClick={closeAddZipModal}
+                    disabled={addZipSaving}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-success btn-sm px-3"
+                    onClick={reviewAddZip}
+                    disabled={addZipSaving || addZipLookupLoading}
+                  >
+                    Review &amp; Add
+                  </button>
+                </>
+              )}
+            </div>
+
+          </div>
+        </div>
+      )}
+
+      {/* ═══ SNOW LOAD MODAL ═══ */}
+      {/* Opened from "Add Snow Load" under Deliver To when the delivery ZIP
+          has no row in metal_s_snowload_data. Saving inserts a row for it. */}
+      {showSnowLoadModal && (
+        <div className="position-fixed top-0 start-0 w-100 h-100 d-flex align-items-center justify-content-center" style={{ zIndex: 10001, background: "rgba(0,0,0,0.65)" }}>
+          <div className="bg-white rounded-3 shadow-lg p-4 position-relative" style={{ maxWidth: 420, width: "90%" }} onClick={(e) => e.stopPropagation()}>
+            <button
+              type="button"
+              className="btn-close position-absolute top-0 end-0 m-3"
+              aria-label="Close"
+              onClick={closeSnowLoadModal}
+              disabled={snowLoadSaving}
+            />
+            <div className="text-center mb-3">
+              <AppIcon icon="snowflake" className="fs-3 text-muted mb-2" />
+              <h5 className="fw-bold mb-1">Add Snow Load</h5>
+              <p className="text-muted small mb-0">
+                No snow load is on file for ZIP {zipCode}. Enter it below — it will be saved for this ZIP code.
+              </p>
+            </div>
+
+            <form onSubmit={saveSnowLoad}>
+              <label className="form-label small mb-0" htmlFor="snowLoadInput">
+                Snow Load (psf) <span className="text-danger">*</span>
+              </label>
+              <input
+                id="snowLoadInput"
+                type="number"
+                min="0"
+                step="any"
+                className={`form-control ${snowLoadError ? "is-invalid" : ""}`}
+                placeholder="e.g. 30"
+                value={snowLoadDraft}
+                onChange={(e) => {
+                  setSnowLoadDraft(e.target.value);
+                  if (snowLoadError) setSnowLoadError(null);
+                }}
+                disabled={snowLoadSaving}
+                autoFocus
+              />
+              {snowLoadError && <div className="invalid-feedback d-block">{snowLoadError}</div>}
+
+              <div className="d-flex justify-content-end gap-2 mt-3">
+                <button type="button" className="btn btn-outline-secondary btn-sm" onClick={closeSnowLoadModal} disabled={snowLoadSaving}>
+                  Cancel
+                </button>
+                <button type="submit" className="btn btn-success btn-sm px-3" disabled={snowLoadSaving || snowLoadDraft === ""}>
+                  {snowLoadSaving ? "Saving…" : "Save Snow Load"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── SNOW LOAD UPCHARGE HELPERS ────────────────────────────
+// metal_s_snowload_rate.upcharge_rate is a fraction (0.05 = 5%).
+
+// Rate → percentage label ("5%", "2.5%").
+function formatSnowLoadRatePct(rate) {
+  const n = Number(rate);
+  if (!Number.isFinite(n)) return "";
+  return `${Number((n * 100).toFixed(2))}%`;
+}
+
+// Snow Load Upcharge = (Base Structure Price + Leg Height Price) × rate,
+// rounded to cents. 0 when no rate applies.
+function computeSnowLoadUpcharge(basePrice, legHeightPrice, rate) {
+  const r = Number(rate);
+  if (!Number.isFinite(r) || r <= 0) return 0;
+  const base = Number(basePrice) || 0;
+  const leg = Number(legHeightPrice) || 0;
+  return Math.round((base + leg) * r * 100) / 100;
+}
+
+// ─── DIMENSION TEXT FIELD (Width / Length / Leg Height) ────
+// Plain text field for the dimension value. Typed input is snapped to the
+// nearest valid price-table value (`options`) on blur/Enter so the committed
+// value is always one the pricing lookups already understand (the lookups match
+// exact / range values from the price matrix). Invalid or empty input reverts
+// to the current value.
+function DimensionSpinner({ label, value, options, onChange, col = "col-4", format = null }) {
+  const list = useMemo(() => [...options].sort((a, b) => a - b), [options]);
+  const [draft, setDraft] = useState(String(value));
+  // Optional `format(value)` label shown while the field is not being edited
+  // (e.g. Loafing Shed Leg Height "12'x9'"); typing still edits the number.
+  const [editing, setEditing] = useState(false);
+  useEffect(() => { setDraft(String(value)); }, [value]);
+
+  const nearestIdx = (n) => {
+    let best = 0;
+    let bestDist = Infinity;
+    list.forEach((v, i) => {
+      const d = Math.abs(v - n);
+      if (d < bestDist) { bestDist = d; best = i; }
+    });
+    return best;
+  };
+
+  const commit = (raw) => {
+    if (list.length === 0) { setDraft(String(value)); return; }
+    const s = String(raw ?? "").trim();
+    if (s === "") { setDraft(String(value)); return; }
+    const n = Number(s);
+    if (!Number.isFinite(n)) { setDraft(String(value)); return; }
+    const snapped = list[nearestIdx(n)];
+    setDraft(String(snapped));
+    onChange(snapped);
+  };
+
+  return (
+    <div className={col}>
+      <label className="form-label small mb-0">{label}</label>
+      <div className="input-group input-group-sm">
+        <input
+          type="text"
+          className="form-control text-center"
+          value={editing || !format ? draft : format(value)}
+          onFocus={() => setEditing(true)}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={() => { setEditing(false); commit(draft); }}
+          onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }}
+        />
+      </div>
+    </div>
+  );
+}
+
+// ─── SECTION DIVIDER ─────────────────────────────────────
+
+function SectionDivider() {
+  return <div className="border-top my-3" />;
+}
+
+// ─── LEAN-TO CARD RADIO GROUP ──────────────────────────────
+// Mirrors the base-structure feature radios (form-check + same inline styles).
+// Options may be plain strings or { value, label } pairs.
+function LtRadioGroup({ sideKey, field, label, value, options, onChange }) {
+  const normalized = options.map((opt) => (typeof opt === "string" ? { value: opt, label: opt } : opt));
+  const currentLabel = normalized.find((o) => o.value === value)?.label ?? value;
+  return (
+    <div className="mb-2">
+      <div className="fw-semibold small mb-1">{label}: {currentLabel}</div>
+      <div className="d-flex flex-column gap-1">
+        {normalized.map((opt) => {
+          const id = `lt-${sideKey}-${field}-${String(opt.value).toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
+          return (
+            <div key={opt.value} className="form-check d-flex align-items-center">
+              <input
+                className="form-check-input"
+                type="radio"
+                name={`lt-${sideKey}-${field}`}
+                id={id}
+                value={opt.value}
+                checked={value === opt.value}
+                onChange={() => onChange(opt.value)}
+                style={{ width: "1.25rem", height: "1.25rem", marginRight: "0.5rem", marginTop: 0, flexShrink: 0 }}
+              />
+              <label className="form-check-label" htmlFor={id}>
+                {opt.label}
+              </label>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ─── ITEM CARD (IdeaRoom-style visual add button) ──────────
+
+function ItemCard({ type, label, items, onAdd }) {
+  return (
+    <div style={{ position: "relative" }}>
+      <div
+        className="text-center border rounded p-2 d-flex flex-column align-items-center justify-content-center"
+        style={{ width: 72, height: 80, cursor: "pointer", background: "#fff", transition: "background 0.15s" }}
+        onClick={() => onAdd(items[0])}
+      >
+        <div style={{ position: "absolute", top: 4, right: 4, background: "#28a745", color: "#fff", borderRadius: "50%", width: 16, height: 16, fontSize: 11, lineHeight: "16px", textAlign: "center" }}>+</div>
+        <div className="d-flex justify-content-center mb-1" style={{ color: "#555" }}>
+          {ITEM_ICONS[type] || <AppIcon icon="plus" className="fs-4" />}
+        </div>
+        <div style={{ fontSize: "0.65rem", lineHeight: 1.2 }}>{label}</div>
+      </div>
+    </div>
+  );
+}
+
+// ─── TOOLBAR BUTTON ────────────────────────────────────────
+
+function ToolbarBtn({ icon, title }) {
+  return (
+    <button className="btn btn-sm btn-light" title={title} style={{ width: 32, height: 32, padding: 0 }}>
+      <AppIcon icon={icon} />
+    </button>
+  );
+}
+
+// ─── FEATURE SUB-TEXT ──────────────────────────────────────
+// Selectors render the feature description as a muted sub-text under the
+// title. When it merely repeats the feature name (a common data-entry
+// artifact — e.g. name "Other Fees" + description "Other Fees"), it adds
+// nothing, so it is suppressed. Comparison ignores case and a trailing "s"
+// (e.g. "Panel" vs "Panels").
+function featureSubtext(feature) {
+  const desc = String(feature?.description ?? "").trim();
+  const name = String(feature?.name ?? "").trim();
+  if (!desc) return "";
+  const norm = (s) => s.toLowerCase().replace(/\s+/g, " ").replace(/s$/, "").trim();
+  return norm(desc) === norm(name) ? "" : desc;
+}
+
+// ─── FRAMING (metal_s_framing) ─────────────────────────────
+// The "Frame Gauge" add-on lists its options from metal_s_framing instead
+// of metal_s_feature_option. Framing rows carry no price column, so the
+// add-on price is 0 — the framing cost is applied via the base structure
+// matrix (metal_m_feature_matrix_price.framing FK).
+function isFrameGaugeFeature(feature) {
+  const name = String(feature?.name ?? "").trim().toLowerCase();
+  const key = String(feature?.render_key ?? "").trim().toLowerCase();
+  return name === "frame gauge" || key === "frame_gauge";
+}
+
+// Resolve a framing_name (stored in addOnItems descriptions) back to its
+// metal_s_framing.id. Used by FramingSelector and the base-structure-price
+// lookup so the selected gauge drives pricing.
+function resolveFramingId(framings, description) {
+  if (description == null) return null;
+  return (framings ?? []).find((f) => f.framing_name === description)?.id ?? null;
+}
+
+function FramingSelector({ feature, framings, onUpdate, addOnItems, onFramingChange }) {
+  const fId = feature.feature_id;
+  const currentItem = addOnItems?.[fId];
+  const selectedId = currentItem ? resolveFramingId(framings, currentItem.description) : null;
+
+  // Emit the selection both as the generic add-on update (state) and as the
+  // framing-specific event (triggers the base structure price lookup).
+  const emit = (item) => {
+    onUpdate(item);
+    onFramingChange?.(item);
+  };
+
+  const handleSelect = (id) => {
+    const nextId = id === selectedId ? null : id;
+    if (!nextId) { emit(null); return; }
+    const f = framings.find((x) => x.id === nextId);
+    if (!f) { emit(null); return; }
+    emit({ featureId: fId, featureName: feature.name, description: f.framing_name, price: 0 });
+  };
+
+  const isSingleOption = framings.length === 1;
+
+  return (
+    <div className="mb-3">
+      <div className="fw-semibold mb-1">{feature.name}</div>
+      {feature.description && <div className="text-muted small mb-2">{feature.description}</div>}
+      <div className="d-flex flex-column gap-1">
+        {framings.map((f) => (
+          <div key={f.id} className="form-check d-flex align-items-center">
+            <input className="form-check-input" type={isSingleOption ? "checkbox" : "radio"} name={`framing-${fId}`}
+              checked={selectedId === f.id} onChange={() => handleSelect(f.id)}
+              id={`framing-${f.id}`}
+              style={{ width: "1.25rem", height: "1.25rem", marginRight: "0.5rem", marginTop: 0, flexShrink: 0 }} />
+            <label className="form-check-label d-flex justify-content-between w-100" htmlFor={`framing-${f.id}`}>
+              <span>{f.framing_name}</span>
+            </label>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── FEATURE SELECTOR (dispatcher) ─────────────────────────
+
+function FeatureSelector({ feature, rates, options, framings = [], addOnItems, updateAddOn, width, length, panelLocations, onFramingChange }) {
+  const onUpdate = useCallback((item) => updateAddOn(feature.feature_id, item), [feature.feature_id, updateAddOn]);
+  // Each selector renders feature.description as a muted sub-text under the
+  // title. When it merely repeats the feature name, drop it so the title isn't
+  // duplicated.
+  const displayFeature = { ...feature, description: featureSubtext(feature) };
+  if (isFrameGaugeFeature(feature)) {
+    return <FramingSelector feature={displayFeature} framings={framings} onUpdate={onUpdate} addOnItems={addOnItems} onFramingChange={onFramingChange} />;
+  }
+  switch (feature.pricing_type) {
+    case "RATE":
+      return <RateSelector feature={displayFeature} rates={rates} onUpdate={onUpdate} />;
+    case "FIXED":
+      return <FixedSelector feature={displayFeature} options={options} onUpdate={onUpdate} addOnItems={addOnItems} />;
+    case "PER_WALL":
+      return <PerWallSelector feature={displayFeature} rates={rates} onUpdate={onUpdate} buildingWidth={width} buildingLength={length} />;
+    default:
+      return null;
+  }
+}
+
+// ─── CUSTOM ADJUSTMENTS (Sales Tool) ───────────────────────
+// metal_s_custom_adjustment stores only the option name, so the input fields
+// are chosen from it:
+//   "…Discount…%…" / "…percent…"  → discountPercent (Percent of building)
+//   "…Discount…"                  → discountAmount  (Amount)
+//   "…Non-Taxable…"               → expenseNonTaxable (Price × Qty, no tax)
+//   "…Expense…" / "…Taxable…"     → expenseTaxable  (Price × Qty, taxed)
+//   anything else / "Note"        → note (Description only)
+function resolveAdjustmentKind(optionName) {
+  const n = String(optionName ?? "").toLowerCase();
+  if (n.includes("discount")) return n.includes("%") || n.includes("percent") ? "discountPercent" : "discountAmount";
+  if (n.includes("non-taxable") || n.includes("non taxable") || n.includes("nontaxable")) return "expenseNonTaxable";
+  if (n.includes("expense") || n.includes("taxable")) return "expenseTaxable";
+  return "note";
+}
+
+let customAdjustmentSeq = 0;
+const newCustomAdjustmentRow = () => ({
+  key: `ca-${Date.now()}-${customAdjustmentSeq++}`,
+  optionId: "", description: "", amount: "", percent: "", price: "", qty: "1",
+});
+
+function CustomAdjustmentsSection({ types = [], rows, setRows, calc }) {
+  const patch = (key, p) => setRows((prev) => prev.map((r) => (r.key === key ? { ...r, ...p } : r)));
+  const remove = (key) => setRows((prev) => prev.filter((r) => r.key !== key));
+  const add = () => setRows((prev) => [...prev, newCustomAdjustmentRow()]);
+  const byId = new Map(types.map((t) => [String(t.id), t]));
+  const money = (id, value, onChange) => (
+    <div className="input-group input-group-sm">
+      <span className="input-group-text">$</span>
+      <input id={id} type="number" min="0" step="0.01" className="form-control" value={value}
+        onChange={(e) => onChange(e.target.value)} />
+    </div>
+  );
+
+  return (
+    <div className="mb-3">
+      <div className="fw-semibold mb-2">Custom Adjustments</div>
+
+      {rows.map((row) => {
+        const type = byId.get(String(row.optionId));
+        const kind = type ? resolveAdjustmentKind(type.option_name) : null;
+        const id = `ca-${row.key}`;
+        return (
+          <div key={row.key} className="border rounded-3 p-3 mb-2">
+            <div className="d-flex justify-content-between align-items-center mb-1">
+              <label className="small text-muted mb-0" htmlFor={`${id}-type`}>Custom Item Type</label>
+              <button type="button" className="btn btn-sm btn-link text-muted p-0" title="Remove" onClick={() => remove(row.key)}>
+                <AppIcon icon="trash-can" />
+              </button>
+            </div>
+            <select id={`${id}-type`} className="form-select form-select-sm mb-2" value={row.optionId}
+              onChange={(e) => patch(row.key, { optionId: e.target.value })}>
+              <option value="" disabled>Select a type</option>
+              {types.map((t) => (
+                <option key={t.id} value={String(t.id)} title={t.option_desctiption || ""}>{t.option_name}</option>
+              ))}
+            </select>
+
+            {type && (<>
+              <label className="small mb-1" htmlFor={`${id}-desc`}>Description</label>
+              <input id={`${id}-desc`} className="form-control form-control-sm mb-2" value={row.description}
+                onChange={(e) => patch(row.key, { description: e.target.value })} />
+            </>)}
+
+            {kind === "discountAmount" && (<>
+              <label className="small mb-1" htmlFor={`${id}-amt`}>Amount</label>
+              {money(`${id}-amt`, row.amount, (v) => patch(row.key, { amount: v }))}
+            </>)}
+
+            {kind === "discountPercent" && (<>
+              <label className="small mb-1" htmlFor={`${id}-pct`}>Percent</label>
+              <div className="input-group input-group-sm">
+                <input id={`${id}-pct`} type="number" min="0" max="100" step="0.01" className="form-control" value={row.percent}
+                  onChange={(e) => patch(row.key, { percent: e.target.value })} />
+                <span className="input-group-text">%</span>
+              </div>
+            </>)}
+
+            {(kind === "expenseTaxable" || kind === "expenseNonTaxable") && (
+              <div className="row g-2">
+                <div className="col-7">
+                  <label className="small mb-1" htmlFor={`${id}-price`}>Price (ea.)</label>
+                  {money(`${id}-price`, row.price, (v) => patch(row.key, { price: v }))}
+                </div>
+                <div className="col-5">
+                  <label className="small mb-1" htmlFor={`${id}-qty`}>Qty.</label>
+                  <input id={`${id}-qty`} type="number" min="1" step="1" className="form-control form-control-sm" value={row.qty}
+                    onChange={(e) => patch(row.key, { qty: e.target.value })} />
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })}
+
+      <button type="button" className="btn btn-sm w-100 d-flex align-items-center gap-2 border rounded-pill px-3 py-2 text-start"
+        onClick={add} disabled={types.length === 0}>
+        <AppIcon icon="plus" /> Add a custom Adjustment
+      </button>
+      {types.length === 0 && (
+        <div className="small text-muted mt-1">No custom adjustment types are set up in Master Data Config.</div>
+      )}
+
+      <div className="rounded-3 p-3 mt-3" style={{ background: "var(--psb-bg, #f2f4f7)" }}>
+        <div className="small text-muted">Total Discounts: {formatCurrency(calc.discount)}</div>
+        <div className="small text-muted mt-1">Total Additional Line Items: {formatCurrency(calc.taxable + calc.nonTaxable)}</div>
+      </div>
+    </div>
+  );
+}
+
+// ─── SIZE-BAND OPTION ──────────────────────────────────────
+// metal_s_feature_option row whose width/length/height ranges contain the
+// building (empty min/max = open-ended); first by sort order. Null if none.
+function findSizeBandOption(options, featureId, width, length, height) {
+  // A dimension passed as null is not checked (e.g. Truss Bow ignores length).
+  const inRange = (v, min, max) => v == null || ((min == null || v >= Number(min)) && (max == null || v <= Number(max)));
+  return (options ?? [])
+    .filter((o) => o.feature_id === featureId)
+    .filter((o) => inRange(width, o.min_width, o.max_width) && inRange(length, o.min_length, o.max_length) && inRange(height, o.min_height, o.max_height))
+    .sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0))[0] ?? null;
+}
+
+// ─── SINGLE QUANTITY OPTION (checkbox + qty) ───────────────
+// One priced option with a quantity (Commercial "Extra Truss Bows"). Stored
+// as its own add-on (itemKey): price = option price × qty, multi: true →
+// the estimate lists "<option> (xN)". No matching option → disabled + a
+// yellow notice (unavailableText).
+function SingleQtyOption({ title, feature, option, itemKey, addOnItems, updateAddOn, qtyLabel = "Qty", unavailableText = null, showQty = true }) {
+  const item = addOnItems?.[itemKey];
+  const [draft, setDraft] = useState(null);
+  const itemFor = (qty) => {
+    const q = Math.max(1, Math.floor(Number(qty) || 1));
+    const unit = Number(option?.price) || 0;
+    return {
+      featureId: feature.feature_id,
+      featureName: feature.name,
+      description: showQty ? `${option.name} (x${q})` : option.name,
+      price: unit * q,
+      multi: true,
+      qty: q,
+      unitPrice: unit,
+      optionName: option.name,
+    };
+  };
+  const toggle = () => {
+    if (!option) return;
+    if (item) { updateAddOn(itemKey, null); setDraft(null); return; }
+    updateAddOn(itemKey, itemFor(1));
+  };
+  const change = (text) => {
+    setDraft(text);
+    const n = Number(text);
+    if (Number.isInteger(n) && n >= 1) updateAddOn(itemKey, itemFor(n));
+  };
+  const id = `qty-single-${String(itemKey).replace(/[^a-z0-9]/gi, "-")}`;
+  return (
+    <div className="mb-3">
+      <div className="fw-semibold mb-1">{title}</div>
+      <div className="form-check d-flex align-items-center gap-2 mb-0" style={{ minHeight: 32 }}>
+        <input className="form-check-input" type="checkbox" id={id}
+          checked={!!item} disabled={!option} onChange={toggle}
+          style={{ width: "1.25rem", height: "1.25rem", marginTop: 0, flexShrink: 0 }} />
+        <label className={`form-check-label ${option ? "" : "text-muted"}`} htmlFor={id}>{option?.name ?? feature.name}</label>
+        {item && option && !showQty && (
+          <span className="small text-muted text-nowrap">${Number(option.price || 0).toFixed(2)}</span>
+        )}
+        {item && option && showQty && (<>
+          <label className="small text-muted mb-0" htmlFor={`${id}-qty`}>{qtyLabel}</label>
+          <input id={`${id}-qty`} type="number" min={1} step={1}
+            className="form-control form-control-sm" style={{ width: 70 }}
+            value={draft ?? String(item.qty ?? 1)}
+            onChange={(e) => change(e.target.value)}
+            onBlur={() => setDraft(null)} />
+          <span className="small text-muted text-nowrap">× ${Number(option.price || 0).toFixed(2)}</span>
+        </>)}
+      </div>
+      {!option && unavailableText && (
+        <div className="alert alert-warning py-1 px-2 small mb-0 mt-1" role="status">{unavailableText}</div>
+      )}
+    </div>
+  );
+}
+
+// ─── REGION-PRICED PER ITEM OPTIONS (Brackets / Anchors) ───
+// metal_s_door_window_item rows of one Per Item feature → option rows for
+// QuantityMultiSelector. Per item name: a row mapped to the delivery region
+// wins; otherwise a row with no region mapping (default for all regions).
+// Rows mapped only to other regions are skipped. `filter(item)` optionally
+// narrows the rows first (e.g. Anchors by installation surface). option_id is
+// name-based (`${idPrefix}-<name>`) so a checked box survives a region change.
+function resolveRegionPricedOptions({ items, featureId, regionId, regionDoorWindow, idPrefix, filter = null }) {
+  if (featureId == null) return [];
+  const rid = regionId != null ? String(regionId) : null;
+  const regionsByItem = new Map();
+  for (const m of regionDoorWindow ?? []) {
+    const k = String(m.item_id);
+    if (!regionsByItem.has(k)) regionsByItem.set(k, new Set());
+    regionsByItem.get(k).add(String(m.region_id));
+  }
+  const byName = new Map();
+  for (const it of items ?? []) {
+    if (it.feature_id !== featureId) continue;
+    if (filter && !filter(it)) continue;
+    const mapped = regionsByItem.get(String(it.item_id));
+    const isDefault = !mapped || mapped.size === 0;
+    const isRegionMatch = !isDefault && rid != null && mapped.has(rid);
+    if (!isDefault && !isRegionMatch) continue;
+    const key = String(it.name ?? "").trim().toLowerCase();
+    const prev = byName.get(key);
+    if (!prev || (isRegionMatch && !prev.isRegionMatch)) byName.set(key, { it, isRegionMatch, key });
+  }
+  return [...byName.values()]
+    .sort((a, b) => (a.it.sort_order ?? 0) - (b.it.sort_order ?? 0))
+    .map(({ it, key }) => ({
+      option_id: `${idPrefix}-${key.replace(/[^a-z0-9]+/g, "-")}`,
+      feature_id: featureId,
+      name: it.name,
+      price: it.price,
+      sort_order: it.sort_order,
+    }));
+}
+
+// Surface name → item_type code: "Gravel / Dirt" → "gravel_dirt".
+function surfaceTypeCode(name) {
+  return String(name ?? "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+}
+
+// ─── QUANTITY MULTI SELECTOR (checkbox + number of sheets) ──
+// FIXED feature where each option can be checked with a quantity (Extra
+// Sheets Metal: 21 ft / 26 ft / 31 ft). Each checked option is its own
+// add-on under "<featureId>:<optionId>": price = option price × quantity,
+// estimate line "<option> (xN)" (multi: true → listed by name only).
+function QuantityMultiSelector({ feature, options: allOptions, addOnItems, updateAddOn, qtyLabel = "Sheets" }) {
+  const fId = feature.feature_id;
+  const featureOptions = allOptions.filter((o) => o.feature_id === fId);
+  const keyFor = (opt) => `${fId}:${opt.option_id}`;
+  // Typed text per option while editing (commit only valid whole numbers ≥ 1).
+  const [drafts, setDrafts] = useState({});
+
+  const itemFor = (opt, qty) => {
+    const q = Math.max(1, Math.floor(Number(qty) || 1));
+    const unit = Number(opt.price) || 0;
+    return {
+      featureId: fId,
+      featureName: feature.name,
+      description: `${opt.name} (x${q})`,
+      price: unit * q,
+      multi: true,
+      qty: q,
+      unitPrice: unit,
+      optionName: opt.name,
+    };
+  };
+
+  const toggle = (opt) => {
+    const key = keyFor(opt);
+    // Clear any old single (radio) choice stored for this feature.
+    if (addOnItems?.[fId]) updateAddOn(fId, null);
+    if (addOnItems?.[key]) {
+      updateAddOn(key, null);
+      setDrafts((d) => { const n = { ...d }; delete n[key]; return n; });
+      return;
+    }
+    updateAddOn(key, itemFor(opt, 1));
+  };
+
+  const changeQty = (opt, text) => {
+    const key = keyFor(opt);
+    setDrafts((d) => ({ ...d, [key]: text }));
+    const n = Number(text);
+    if (Number.isInteger(n) && n >= 1) updateAddOn(key, itemFor(opt, n));
+  };
+
+  const blurQty = (opt) => {
+    const key = keyFor(opt);
+    setDrafts((d) => { const n = { ...d }; delete n[key]; return n; });
+  };
+
+  return (
+    <div className="mb-3">
+      <div className="fw-semibold mb-1">{feature.name}</div>
+      {feature.description && <div className="text-muted small mb-2">{feature.description}</div>}
+      <div className="d-flex flex-column gap-1">
+        {featureOptions.map((opt) => {
+          const key = keyFor(opt);
+          const item = addOnItems?.[key];
+          const id = `qty-opt-${opt.option_id}`;
+          return (
+            /* One row: checkbox + name, then (when checked) Sheets + box + unit
+               price. Fixed name width keeps the boxes aligned; fixed row
+               height stops the list jumping when a box appears. */
+            <div key={opt.option_id} className="form-check d-flex align-items-center gap-2 mb-0" style={{ minHeight: 32 }}>
+              <input className="form-check-input" type="checkbox" id={id}
+                checked={!!item} onChange={() => toggle(opt)}
+                style={{ width: "1.25rem", height: "1.25rem", marginTop: 0, flexShrink: 0 }} />
+              <label className="form-check-label" htmlFor={id} style={{ minWidth: 48 }}>{opt.name}</label>
+              {item && (<>
+                <label className="small text-muted mb-0" htmlFor={`${id}-qty`}>{qtyLabel}</label>
+                <input id={`${id}-qty`} type="number" min={1} step={1}
+                  className="form-control form-control-sm" style={{ width: 70 }}
+                  value={drafts[key] ?? String(item.qty ?? 1)}
+                  onChange={(e) => changeQty(opt, e.target.value)}
+                  onBlur={() => blurQty(opt)} />
+                <span className="small text-muted text-nowrap">× ${Number(opt.price || 0).toFixed(2)}</span>
+              </>)}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ─── MULTI FIXED SELECTOR (checkboxes) ─────────────────────
+// FIXED feature where any number of options can be checked (Other Fees).
+// Each checked option is its own add-on under "<featureId>:<optionId>"
+// (featureId kept, multi: true) so every fee is priced (addOnTotal) and
+// listed separately in the estimate. A legacy single choice stored under
+// addOnItems[featureId] shows as checked and is cleared when unchecked.
+function MultiFixedSelector({ feature, options: allOptions, addOnItems, updateAddOn }) {
+  const fId = feature.feature_id;
+  const featureOptions = allOptions.filter((o) => o.feature_id === fId);
+  const keyFor = (opt) => `${fId}:${opt.option_id}`;
+  const legacy = addOnItems?.[fId];
+  const isChecked = (opt) => !!addOnItems?.[keyFor(opt)] || legacy?.description === opt.name;
+
+  const toggle = (opt) => {
+    if (isChecked(opt)) {
+      updateAddOn(keyFor(opt), null);
+      if (legacy?.description === opt.name) updateAddOn(fId, null);
+      return;
+    }
+    updateAddOn(keyFor(opt), {
+      featureId: fId,
+      featureName: feature.name,
+      description: opt.name,
+      price: Number(opt.price) || 0,
+      multi: true,
+    });
+  };
+
+  return (
+    <div className="mb-3">
+      <div className="fw-semibold mb-1">{feature.name}</div>
+      {feature.description && <div className="text-muted small mb-2">{feature.description}</div>}
+      <div className="d-flex flex-column gap-1">
+        {featureOptions.map((opt) => (
+          <div key={opt.option_id} className="form-check d-flex align-items-center">
+            <input className="form-check-input" type="checkbox"
+              checked={isChecked(opt)} onChange={() => toggle(opt)}
+              id={`multi-opt-${opt.option_id}`}
+              style={{ width: "1.25rem", height: "1.25rem", marginRight: "0.5rem", marginTop: 0, flexShrink: 0 }} />
+            <label className="form-check-label d-flex justify-content-between w-100" htmlFor={`multi-opt-${opt.option_id}`}>
+              <span>{opt.name}</span>
+            </label>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── RATE SELECTOR ─────────────────────────────────────────
+
+function RateSelector({ feature, rates, onUpdate }) {
+  const fId = feature.feature_id;
+  const rateRow = rates.find((r) => r.feature_id === fId);
+  const [enabled, setEnabled] = useState(false);
+  const [measurement, setMeasurement] = useState("");
+  const unitLabel = rateRow?.unit === "sqft" ? "sq ft" : "linear ft";
+
+  const handleChange = (en, val) => {
+    if (!en || !rateRow) { onUpdate(null); return; }
+    const parsed = parseFloat(val);
+    if (isNaN(parsed) || parsed <= 0) { onUpdate(null); return; }
+    const price = parsed * Number(rateRow.rate);
+    onUpdate({ featureId: fId, featureName: feature.name, description: `${parsed} ${unitLabel} × $${rateRow.rate}/${unitLabel}`, price });
+  };
+
+  return (
+    <div className="mb-3">
+      <div className="form-check d-flex align-items-start mb-2">
+        <input className="form-check-input" type="checkbox" checked={enabled}
+          onChange={(e) => { setEnabled(e.target.checked); handleChange(e.target.checked, measurement); }}
+          id={`chk-${fId}`}
+          style={{ width: "1.25rem", height: "1.25rem", marginRight: "0.5rem", marginTop: "0.0625rem", flexShrink: 0 }} />
+        <div>
+          <label className="form-check-label fw-semibold" htmlFor={`chk-${fId}`}>{feature.name}</label>
+          {feature.description && <div className="text-muted small">{feature.description}</div>}
+        </div>
+      </div>
+      {enabled && rateRow && (
+        <div className="d-flex align-items-center gap-2 mb-2">
+          <input type="number" min="0" step="0.5" className="form-control form-control-sm" style={{ width: 120 }}
+            placeholder={unitLabel} value={measurement}
+            onChange={(e) => { setMeasurement(e.target.value); handleChange(true, e.target.value); }} />
+          <span className="text-muted small">{unitLabel} × ${rateRow.rate}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── FIXED SELECTOR ────────────────────────────────────────
+
+function FixedSelector({ feature, options: allOptions, onUpdate, addOnItems }) {
+  const fId = feature.feature_id;
+  const featureOptions = allOptions.filter((o) => o.feature_id === fId);
+  const currentItem = addOnItems?.[fId];
+  // Selection is derived from the parent's add-on state so external resets
+  // (e.g. style-change defaults) stay in sync with the priced items.
+  const selectedId = currentItem
+    ? featureOptions.find((o) => o.name === currentItem.description)?.option_id ?? null
+    : null;
+
+  const handleSelect = (optionId) => {
+    const newId = optionId === selectedId ? null : optionId;
+    if (!newId) { onUpdate(null); return; }
+    const opt = featureOptions.find((o) => o.option_id === newId);
+    if (!opt) { onUpdate(null); return; }
+    onUpdate({ featureId: fId, featureName: feature.name, description: opt.name, price: Number(opt.price) });
+  };
+
+  const isSingleOption = featureOptions.length === 1;
+
+  return (
+    <div className="mb-3">
+      <div className="fw-semibold mb-1">{feature.name}</div>
+      {feature.description && <div className="text-muted small mb-2">{feature.description}</div>}
+      <div className="d-flex flex-column gap-1">
+        {featureOptions.map((opt) => (
+          <div key={opt.option_id} className="form-check d-flex align-items-center">
+            <input className="form-check-input" type={isSingleOption ? "checkbox" : "radio"} name={`fixed-${fId}`}
+              checked={selectedId === opt.option_id} onChange={() => handleSelect(opt.option_id)}
+              id={`opt-${opt.option_id}`}
+              style={{ width: "1.25rem", height: "1.25rem", marginRight: "0.5rem", marginTop: 0, flexShrink: 0 }} />
+            <label className="form-check-label d-flex justify-content-between w-100" htmlFor={`opt-${opt.option_id}`}>
+              <span>{opt.name}</span>
+            </label>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── PER-WALL SELECTOR ────────────────────────────────────
+
+function PerWallSelector({ feature, rates, onUpdate, buildingWidth, buildingLength }) {
+  const fId = feature.feature_id;
+  const rateRow = rates.find((r) => r.feature_id === fId);
+  const [selected, setSelected] = useState({ roof: false, left: false, right: false, front: false, back: false });
+
+  const calcPrice = (sel) => {
+    if (!rateRow) return 0;
+    const rate = Number(rateRow.rate);
+    let total = 0;
+    if (sel.roof) total += (buildingWidth + buildingLength) * 2 * rate;
+    if (sel.left) total += buildingLength * rate;
+    if (sel.right) total += buildingLength * rate;
+    if (sel.front) total += buildingWidth * rate;
+    if (sel.back) total += buildingWidth * rate;
+    return total;
+  };
+
+  const handleToggle = (wall) => {
+    const next = { ...selected, [wall]: !selected[wall] };
+    setSelected(next);
+    const price = calcPrice(next);
+    const enabledWalls = Object.entries(next).filter(([, v]) => v).map(([k]) => k);
+    if (enabledWalls.length === 0) { onUpdate(null); return; }
+    onUpdate({ featureId: fId, featureName: feature.name, description: enabledWalls.join(", "), price });
+  };
+
+  return (
+    <div className="mb-3">
+      <div className="fw-semibold mb-1">{feature.name}</div>
+      {feature.description && <div className="text-muted small mb-2">{feature.description}</div>}
+      {["roof", "left", "front", "right", "back"].map((wall) => (
+        <div key={wall} className="form-check d-flex align-items-center">
+          <input className="form-check-input" type="checkbox" checked={selected[wall]}
+            onChange={() => handleToggle(wall)} id={`pw-${fId}-${wall}`}
+            style={{ width: "1.25rem", height: "1.25rem", marginRight: "0.5rem", marginTop: 0, flexShrink: 0 }} />
+          <label className="form-check-label" htmlFor={`pw-${fId}-${wall}`}>
+            {wall.charAt(0).toUpperCase() + wall.slice(1)}{wall === "roof" ? "" : " Wall"}
+          </label>
+        </div>
+      ))}
+      {rateRow && <div className="text-muted small mt-1">${rateRow.rate}/linear ft</div>}
+    </div>
+  );
+}

@@ -1,0 +1,219 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import { Button } from "react-bootstrap";
+import Form from "react-bootstrap/Form";
+import { IS_MODULE, SSO_ENABLED, validateSessionToken } from "@/core/sso-client";
+import { canSeeDeveloperTabsAction } from "@/core/auth/navAccess.actions.js";
+
+// Core's own tabs are plain paths, so they stay on whichever site is serving
+// the page (localhost, dev or prod). A module app runs on another host, so
+// its tabs link back to the portal configured for that deployment.
+const CORE_PORTAL_URL = IS_MODULE
+  ? (process.env.NEXT_PUBLIC_CORE_PORTAL_URL || "https://www.psbuniverse.com").replace(/\/+$/, "")
+  : "";
+const DALLAS_TIME_ZONE = "America/Chicago";
+
+function getDallasHour() {
+  try {
+    const hourText = new Intl.DateTimeFormat("en-US", {
+      hour: "2-digit",
+      hour12: false,
+      timeZone: DALLAS_TIME_ZONE,
+    }).format(new Date());
+
+    const hour = Number(hourText);
+    return Number.isFinite(hour) ? hour : new Date().getHours();
+  } catch {
+    return new Date().getHours();
+  }
+}
+
+function getTimeGreeting() {
+  const hour = getDallasHour();
+
+  if (hour < 12) return "Good morning";
+  if (hour < 18) return "Good afternoon";
+  return "Good evening";
+}
+
+function normalizePath(value) {
+  return String(value || "/").toLowerCase();
+}
+
+function isMyPsbPath(pathname) {
+  const path = normalizePath(pathname);
+  return path === "/profile" || path.startsWith("/profile/") || path === "/company";
+}
+
+function isConfigurationPath(pathname) {
+  const path = normalizePath(pathname);
+  return path.startsWith("/setup");
+}
+
+function isMyAppsPath(pathname) {
+  if (isMyPsbPath(pathname)) {
+    return false;
+  }
+
+  if (isConfigurationPath(pathname)) {
+    return true;
+  }
+
+  const path = normalizePath(pathname);
+  return (
+    path === "/" ||
+    path === "/dashboard" ||
+    path.startsWith("/dashboard/")
+  );
+}
+
+function isExamplesPath(pathname) {
+  const path = normalizePath(pathname);
+  return path === "/examples" || path.startsWith("/examples/");
+}
+
+function isDocsPath(pathname) {
+  const path = normalizePath(pathname);
+  return path === "/psbpages/documentation" || path.startsWith("/psbpages/documentation/");
+}
+
+export default function Header({
+  user,
+  roles = [],
+  pathname = "/",
+  onLogout,
+  logoutBusy = false,
+  onNavigateStart,
+  loaderProgress = 0,
+  loaderVisible = false,
+}) {
+  const [greeting, setGreeting] = useState(() => getTimeGreeting());
+
+  useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      setGreeting(getTimeGreeting());
+    }, 60 * 1000);
+
+    return () => window.clearInterval(intervalId);
+  }, []);
+
+  const displayName = useMemo(() => {
+    const firstName = String(user?.first_name || "").trim();
+    if (firstName) return firstName;
+    return user?.username || user?.email || "User";
+  }, [user]);
+
+  // Example / Docs tabs: shown when the user's role is given a card that opens
+  // the Examples page (Card Module Setup). Hidden until the answer arrives.
+  //  - Module apps (signed in through core): core answers in the session check
+  //    they already make (canSeeDeveloperTabs from /api/auth/introspect).
+  //  - Core: ask the server directly.
+  const [canSeeExamples, setCanSeeExamples] = useState(false);
+  useEffect(() => {
+    let active = true;
+    const check = IS_MODULE && SSO_ENABLED
+      ? validateSessionToken().then((session) => session?.canSeeDeveloperTabs === true)
+      : canSeeDeveloperTabsAction();
+    Promise.resolve(check)
+      .then((allowed) => { if (active) setCanSeeExamples(Boolean(allowed)); })
+      .catch(() => { if (active) setCanSeeExamples(false); });
+    return () => { active = false; };
+  }, [user?.user_id]);
+
+  const tabs = useMemo(() => {
+    // These tabs represent the main PSBUniverse hub. In a module app
+    // CORE_PORTAL_URL is the portal's address (NEXT_PUBLIC_CORE_PORTAL_URL), so
+    // clicking them from a module host (e.g. map.psbuniverse.com) performs a
+    // real browser navigation back to the portal. In core it is empty, so the
+    // links are plain paths on the current site.
+    const nextTabs = [
+      {
+        key: "my-psb",
+        label: "My PSB",
+        href: `${CORE_PORTAL_URL}/profile`,
+        active: isMyPsbPath(pathname),
+      },
+      {
+        key: "my-apps",
+        label: "My Apps",
+        href: `${CORE_PORTAL_URL}/dashboard`,
+        active: isMyAppsPath(pathname),
+      },
+    ];
+
+    if (canSeeExamples) {
+      nextTabs.push({
+        key: "example",
+        label: "Example",
+        href: `${CORE_PORTAL_URL}/examples`,
+        active: isExamplesPath(pathname),
+      });
+
+      nextTabs.push({
+        key: "docs",
+        label: "Docs",
+        href: `${CORE_PORTAL_URL}/psbpages/documentation`,
+        active: isDocsPath(pathname),
+      });
+    }
+
+    return nextTabs;
+  }, [canSeeExamples, pathname]);
+
+  const activeTab = tabs.find((tab) => tab.active) || tabs[0];
+
+  return (
+    <header className="app-header d-flex align-items-center justify-content-between gap-2">
+      <div className="d-flex align-items-center gap-3 flex-wrap app-header-left">
+        <div>
+          <h1 className="app-header-title mb-0">PSBUniverse</h1>
+          <p className="app-header-subtitle mb-0">Operations Workspace</p>
+        </div>
+        <nav className="app-header-tabs d-none d-md-flex" aria-label="Primary tabs">
+          {tabs.map((tab) => (
+            <a
+              key={tab.key}
+              href={tab.href}
+              className={`app-header-tab ${tab.active ? "active" : ""}`}
+            >
+              {tab.label}
+            </a>
+          ))}
+        </nav>
+        <div className="app-header-mobile-nav d-md-none">
+          <Form.Select
+            size="sm"
+            aria-label="Primary navigation"
+            value={activeTab.href}
+          onChange={(event) => {
+            onNavigateStart?.();
+            window.location.href = event.target.value;
+          }}
+          >
+            {tabs.map((tab) => (
+              <option key={tab.key} value={tab.href}>
+                {tab.label}
+              </option>
+            ))}
+          </Form.Select>
+        </div>
+      </div>
+      <div className="d-flex align-items-center gap-2 app-header-right">
+        <p className="app-header-user mb-0">{`${greeting}, ${displayName}`}</p>
+        <Button variant="outline-primary" size="sm" onClick={onLogout} disabled={logoutBusy}>
+          {logoutBusy ? "Signing out..." : "Logout"}
+        </Button>
+      </div>
+      <div className="app-header-progress-shell" aria-hidden="true">
+        <div
+          className="app-header-progress-bar"
+          style={{
+            transform: `scaleX(${loaderProgress})`,
+            opacity: loaderVisible ? 1 : 0,
+          }}
+        />
+      </div>
+    </header>
+  );
+}

@@ -1,0 +1,561 @@
+// ═══════════════════════════════════════════════════════════
+// STYLE PROFILES — Single source of truth per building style
+//
+// Each profile declares everything about a building type:
+//   - rendering:    3D structural rules (roof shape, columns, trusses)
+//   - defaults:     wall modes, siding direction
+//   - blockedFeatures: add-on features excluded from this style (by render_key)
+//   - allowedAccessories: which door/window types are valid (null = all)
+//
+// Keyed by render_key from metal_s_style DB table.
+// The configurator loads the selected style's profile and
+// dynamically renders only what that profile allows.
+// ═══════════════════════════════════════════════════════════
+
+const PROFILES = {
+  regular: {
+    label: "Regular Carport",
+    rendering: {
+      kneeBraces: true,
+      eaveOverhangFt: 0,
+      ridgeCap: true,
+      roofPanelDir: "vertical",
+      roofPanel3D: true,
+      hasTruss: true,
+      hasPurlins: true,
+      hasLatticeColumns: false,
+      
+    },
+    defaults: {
+      walls: { front: false, back: false, left: false, right: false },
+      wallMode: "open",
+    },
+    structureDefaults: {
+      roofPitch: null,
+      roofOverhang: null,
+      trusses: "Standard",
+      gauge: "Standard Framing",
+      brace: "Standard Brace",
+      legHeight: 6,
+      installationSurface: "Concrete",
+      anchorPackage: "Concrete",
+    },
+    blockedFeatures: ["roof_pitch", "roof_overhang"],
+    allowedAccessories: null,
+  },
+
+  aframe: {
+    label: "A-Frame Carport",
+    rendering: {
+      kneeBraces: true,
+      eaveOverhangFt: 0,
+      ridgeCap: true,
+      roofPanelDir: "horizontal",
+      hasTruss: true,
+      hasPurlins: true,
+      hasLatticeColumns: false,
+    },
+    defaults: {
+      walls: { front: false, back: false, left: false, right: false },
+      wallMode: "open",
+    },
+    structureDefaults: {
+      roofPitch: null,
+      roofOverhang: null,
+      trusses: "Standard",
+      gauge: "Standard Framing",
+      brace: "Standard Brace",
+      legHeight: 6,
+      installationSurface: "Concrete",
+      anchorPackage: "Concrete",
+    },
+    blockedFeatures: ["roof_pitch", "roof_overhang"],
+    allowedAccessories: null,
+  },
+
+  aframe_vertical: {
+    label: "A-Frame Vertical Carport",
+    rendering: {
+      kneeBraces: true,
+      eaveOverhangFt: 0,
+      ridgeCap: false,
+      roofPanelDir: "vertical",
+      roofPanel3D: true,
+      hasTruss: true,
+      hasPurlins: true,
+      hasLatticeColumns: false,
+    },
+    defaults: {
+      walls: { front: false, back: false, left: false, right: false },
+      wallMode: "open",
+    },
+    structureDefaults: {
+      roofPitch: "3/12",
+      roofOverhang: "6\"",
+      trusses: "Standard",
+      gauge: "Standard Framing",
+      brace: "Standard Brace",
+      legHeight: 8,
+      installationSurface: "Concrete",
+      anchorPackage: "Concrete",
+    },
+    blockedFeatures: [],
+    allowedAccessories: null,
+  },
+
+  rib_type: {
+    label: "Rib Type",
+    rendering: {
+      kneeBraces: true,
+      eaveOverhangFt: 0,
+      ridgeCap: true,
+      roofPanelDir: "vertical",
+      roofPanel3D: true,
+      hasTruss: true,
+      hasPurlins: true,
+      hasLatticeColumns: false,
+    },
+    defaults: {
+      walls: { front: false, back: false, left: false, right: false },
+      wallMode: "open",
+    },
+    structureDefaults: {
+      roofPitch: "3/12",
+      roofOverhang: "6\"",
+      trusses: "Standard",
+      gauge: "Standard Framing",
+      brace: "Standard Brace",
+      legHeight: 8,
+      installationSurface: "Concrete",
+      anchorPackage: "Concrete",
+    },
+    blockedFeatures: [],
+    allowedAccessories: null,
+  },
+
+  truss: {
+    label: "Truss",
+    rendering: {
+      kneeBraces: true,
+      eaveOverhangFt: 0,
+      ridgeCap: true,
+      roofPanelDir: "vertical",
+      hasTruss: true,
+      hasPurlins: true,
+      hasLatticeColumns: true,
+      hasGirts: true,
+    },
+    defaults: {
+      walls: { front: false, back: false, left: false, right: false },
+      wallMode: "open",
+    },
+    structureDefaults: {
+      roofPitch: "3/12",
+      roofOverhang: "6\"",
+      trusses: "Heavy Duty",
+      gauge: "Standard Framing",
+      brace: "Standard Brace",
+      legHeight: 8,
+      installationSurface: "Concrete",
+      anchorPackage: "Concrete",
+    },
+    blockedFeatures: [],
+    allowedAccessories: null,
+  },
+
+  commercial: {
+    label: "Commercial",
+    // Reference look: vertical siding when no Siding Panel option is chosen.
+    defaultSetup: {
+      siding: "Vertical",
+    },
+    rendering: {
+      kneeBraces: true,
+      eaveOverhangFt: 0,
+      ridgeCap: true,
+      roofPanelDir: "vertical",
+      hasTruss: true,
+      hasPurlins: false,
+      hasLatticeColumns: true,
+      hasGirts: false,
+      hasRidgeBeam: false,
+    },
+    defaults: {
+      walls: { front: false, back: false, left: false, right: false },
+      wallMode: "open",
+    },
+    structureDefaults: {
+      roofPitch: "3/12",
+      roofOverhang: "6\"",
+      trusses: "Heavy Duty",
+      gauge: "Standard Framing",
+      brace: "Standard Brace",
+      legHeight: 8,
+      installationSurface: "Concrete",
+      anchorPackage: "Concrete",
+    },
+    blockedFeatures: [],
+    allowedAccessories: null,
+  },
+
+  garage: {
+    label: "Garage",
+    rendering: {
+      kneeBraces: true,
+      eaveOverhangFt: 0,
+      ridgeCap: true,
+      roofPanelDir: "vertical",
+      hasTruss: true,
+      hasPurlins: true,
+      hasLatticeColumns: false,
+    },
+    defaults: {
+      walls: { front: "enclosed", back: "enclosed", left: "enclosed", right: "enclosed" },
+      wallMode: "enclosed",
+    },
+    structureDefaults: {
+      roofPitch: "3/12",
+      roofOverhang: "6\"",
+      trusses: "Triple Wide",
+      gauge: "14-Gauge Framing",
+      brace: "Standard Brace",
+      legHeight: 10,
+      installationSurface: "Concrete",
+      anchorPackage: "Concrete",
+    },
+    // ─── DEFAULT SETUP (reference garage quote: 30×30×10) ───
+    // Applied when the Garage style is selected. Named values are resolved
+    // against the live DB (metal_s_feature_option, metal_s_color_group/option,
+    // metal_s_door_window_item) at runtime; exact hex colors are used directly.
+    // Missing named values are skipped gracefully — no IDs are hard-coded.
+    defaultSetup: {
+      size: { width: 30, length: 30, height: 10 },
+      // Color group name → color option name or exact hex value.
+      colors: {
+        Roof: "Gray",
+        Trim: "White",
+        Siding: "#96642c",
+        "Rollup Door": "Bright White",
+      },
+      // Feature name → feature option name (merged after metal_s_style_default).
+      addons: {
+        Trusses: "Triple Wide",
+        "Engineer Certified": "Included 105/30 Certification",
+      },
+      // Siding seam direction for the Siding Panel feature ("Horizontal"|"Vertical").
+      siding: "Horizontal",
+      // Wall → opening item spec. matched by item_type + parsed WxH from the
+      // item name (falls back to name keywords). posFt 0 = centered on the wall.
+      openings: [
+        { wall: "front", type: "rollup_door", widthFt: 10, heightFt: 10, posFt: 0 },
+        // Prehung door near the FRONT corner of the left wall (negative posFt
+        // shifts toward the roll-up door / front gable end). On the default
+        // 30′ wall the door's 36″ near-edge sits ~1.5′ from the corner.
+        { wall: "left", type: "door", widthIn: 36, heightIn: 80, nameHint: "prehung", posFt: -12 },
+        // On the default 30′ wall, the window's near edge is 11′8″ from the
+        // front corner and its far edge is 16′4″ from the back corner. Align
+        // its top with the 80″ door: 80″ - 36″ leaves a 44″ sill.
+        { wall: "left", type: "window", widthIn: 24, heightIn: 36, nameHint: "single pane white w/ grid", posFt: -7 / 3, sillFt: 44 / 12 },
+      ],
+    },
+    blockedFeatures: [],
+    allowedAccessories: null,
+  },
+
+  barn: {
+    label: "Barn",
+    rendering: {
+      kneeBraces: true,
+      eaveOverhangFt: 0,
+      ridgeCap: true,
+      roofPanelDir: "vertical",
+      hasTruss: true,
+      hasPurlins: true,
+      hasLatticeColumns: false,
+    },
+    defaults: {
+      walls: { front: "enclosed", back: "enclosed", left: "enclosed", right: "enclosed" },
+      wallMode: "enclosed",
+    },
+    structureDefaults: {
+      roofPitch: "4/12",
+      roofOverhang: "6\"",
+      trusses: "Standard",
+      gauge: "Standard Framing",
+      brace: "Standard Brace",
+      legHeight: 8,
+      installationSurface: "Concrete",
+      anchorPackage: "Concrete",
+    },
+    blockedFeatures: [],
+    allowedAccessories: null,
+  },
+  step_down_barn: {
+    label: "Step Down Barn",
+    // Reference order look. Group and option names are matched against the live
+    // DB by name (missing names are skipped), like the Garage's defaultSetup.
+    defaultSetup: {
+      colors: {
+        Roof: "Bright White",
+        Trim: "White",
+        Siding: "Red",
+        Wainscot: "Gray",
+      },
+    },
+    rendering: {
+      kneeBraces: true,
+      eaveOverhangFt: 0,
+      ridgeCap: true,
+      roofPanelDir: "vertical",
+      roofPanel3D: true,
+      hasTruss: true,
+      hasPurlins: true,
+      hasLatticeColumns: false,
+      // Step-down (raised-center) shape: the left/right sections are REAL
+      // lean-tos. defaultLeantos describes the lean-tos the configurator
+      // auto-adds while this style is active (sizes snap to the "Attached
+      // Lean To" pricing-matrix options).
+      stepDown: {
+        defaultLeantos: [
+          // Leg height is omitted on purpose: lean-tos default to the center
+          // leg height − 4 ft (snapped to a listed option) in makeDefaultLeanto.
+          { side_key: "left", widthFt: 12, wallMode: "enclosed", frontFrameout: { widthFt: 8, heightFt: 7 } },
+          { side_key: "right", widthFt: 12, wallMode: "enclosed", frontFrameout: { widthFt: 8, heightFt: 7 } },
+        ],
+      },
+    },
+    defaults: {
+      walls: { front: false, back: false, left: false, right: false },
+      wallMode: "open",
+    },
+    structureDefaults: {
+      roofPitch: "3/12",
+      roofOverhang: "6\"",
+      trusses: "Standard",
+      gauge: "Standard Framing",
+      brace: "Standard Brace",
+      legHeight: 8,
+      installationSurface: "Concrete",
+      anchorPackage: "Concrete",
+    },
+    blockedFeatures: [],
+    allowedAccessories: null,
+  },
+
+  // Free Standing Lean To — standalone mono-slope shelter (not attached to a
+  // host building). One roof plane from the tall "Back" eave down to the short
+  // "Front" eave across the width; open sides, knee-braced posts, like the
+  // IdeaRoom reference "Free Standing Lean To (12×20×9×7)".
+  free_standing_lean_to: {
+    label: "Free Standing Lean To",
+    rendering: {
+      monoSlope: true,
+      kneeBraces: true,
+      eaveOverhangFt: 0,
+      ridgeCap: false,
+      roofPanelDir: "vertical",
+      roofPanel3D: true,
+      hasTruss: false,
+      hasPurlins: true,
+      hasLatticeColumns: false,
+      hasGirts: false,
+    },
+    defaults: {
+      walls: { front: false, back: false, left: false, right: false },
+      wallMode: "open",
+    },
+    structureDefaults: {
+      // Slope comes from the Back/Front eave heights, not a pitch add-on.
+      roofPitch: null,
+      roofOverhang: "6\"",
+      trusses: "Standard",
+      gauge: "Standard Framing",
+      brace: "Standard Brace",
+      legHeight: 7,
+      installationSurface: "Concrete",
+      anchorPackage: "Concrete",
+    },
+    blockedFeatures: ["roof_pitch"],
+    allowedAccessories: null,
+  },
+
+  // Loafing Shed — enclosed mono-slope shed (reference "Loafing Shed
+  // 12×30×12×9"): tall eave on the -X ("left") side, short eave on +X. An
+  // enclosed storage room sits at the front end (-Z), closed off by a cross
+  // wall; the tall side is open over the stall beyond it, on a few posts.
+  // "Roof Extension" draws a 4′ awning off the tall (open) side, sloping down
+  // away from the building (rendering.roofExtensionFt / roofExtensionSide).
+  loafing_shed: {
+    label: "Loafing Shed",
+    rendering: {
+      monoSlope: true,
+      // Fixed roof slope for the low eave (reference 3/12: 12′ tall → 9′ low on
+      // a 12′ wide shed). Used because the Roof Pitch control is hidden for
+      // this style (blockedFeatures: roof_pitch).
+      monoSlopePitch: 0.25,
+      // Small roof overhang past the front end wall (reference look), feet.
+      frontOverhangFt: 1,
+      // Roof Extension (when selected): 4′ awning off the tall (-X) eave —
+      // "tall" draws it on the side instead of the default bay past the back end.
+      roofExtensionFt: 4,
+      roofExtensionSide: "tall",
+      // Storage room + open stall layout (MonoSlopeBuilding). Applies only
+      // while the tall ("left") side is fully enclosed.
+      loafing: {
+        storageFt: 10,    // enclosed room depth from the front end (-Z)
+        openSidePosts: 1, // intermediate tall-side posts across the open stall
+      },
+      kneeBraces: true,
+      eaveOverhangFt: 0,
+      ridgeCap: false,
+      roofPanelDir: "vertical",
+      roofPanel3D: true,
+      hasTruss: false,
+      hasPurlins: true,
+      hasLatticeColumns: false,
+      hasGirts: false,
+    },
+    defaults: {
+      // All four walls enclosed per the reference; the 3D opens the tall side
+      // over the stall (rendering.loafing).
+      walls: { front: true, back: true, left: true, right: true },
+      wallMode: "enclosed",
+    },
+    structureDefaults: {
+      // Slope comes from the Back/Front eave heights, not a pitch add-on.
+      // Fixed reference pitch (the Roof Pitch control is hidden for this
+      // style); matches rendering.monoSlopePitch (0.25).
+      roofPitch: "3/12",
+      roofOverhang: "6\"",
+      trusses: "Standard",
+      gauge: "Standard Framing",
+      brace: "Standard Brace",
+      legHeight: 8,
+      installationSurface: "Dirt",
+      anchorPackage: "Concrete",
+    },
+    // Reference order look (Premium Steel Buildings "Loafing Shed 12×30×12×9"):
+    // Roof/Trim/Wainscot: Buckskin · Siding: Plum · Rollup Door: Bright White
+    // Installation: Dirt · 10′ storage room at the front end · 8×8 roll-up
+    // door on the tall (left) side, inside that room.
+    defaultSetup: {
+      // Reference size 12′ wide × 30′ long × 12′ leg (low side 9′ from the
+      // 3/12 monoSlopePitch). Overrides the DB style defaults in the configurator.
+      size: { width: 12, length: 30, height: 12 },
+      colors: {
+        Roof: "Buckskin",
+        Trim: "Buckskin",
+        Siding: "Plum",
+        Wainscot: "Buckskin",
+        "Rollup Door": "Bright White",
+      },
+      siding: "Horizontal",
+      openings: [
+        // posFt -10 on the default 30′ wall → door spans 1′–9′ from the front
+        // corner, inside the 10′ storage room (rendering.loafing.storageFt).
+        { wall: "left", type: "rollup_door", widthFt: 8, heightFt: 8, posFt: -10 },
+      ],
+    },
+    blockedFeatures: ["roof_pitch"],
+    allowedAccessories: null,
+  },
+};
+
+// ─── DEFAULT PROFILE (fallback) ─────────────────────────
+const DEFAULT_PROFILE = PROFILES.rib_type;
+
+/**
+ * Resolve the 3D render key for a metal_s_style row.
+ *
+ * The Step Down Barn shape is driven by the style NAME ("…Step Down…"), which
+ * wins over the stored render_key so the raised-center + wings rendering kicks
+ * in regardless of how the row's render_key was entered. Everything else falls
+ * back to render_key, then the name.
+ */
+export function resolveStyleKey(style) {
+  const name = String(style?.name ?? "").toLowerCase();
+  if (name.includes("step")) return "step_down_barn";
+  // Commercial is driven by the style NAME (like Step Down Barn) so the
+  // trussed-column frame kicks in regardless of how the row's render_key
+  // was entered in metal_s_style.
+  if (name.includes("commercial")) return "commercial";
+  // Free Standing Lean To — standalone mono-slope shelter. Matched on the
+  // style NAME so the mono-slope frame kicks in regardless of how the row's
+  // render_key was entered (e.g. 'leanto', 'lean_to'). Deliberately requires
+  // "free standing" so other lean-to styles (e.g. "Wraparound Lean-Tos")
+  // never resolve here.
+  if (name.includes("free standing") || name.includes("freestanding") || name.includes("free-standing")) {
+    return "free_standing_lean_to";
+  }
+  // Loafing Shed — enclosed mono-slope shed + "Roof Extension" awning. Matched
+  // on the style NAME (like Step Down Barn / Commercial) so the mono-slope +
+  // extended roofline kicks in regardless of the row's stored render_key.
+  if (name.includes("loafing")) return "loafing_shed";
+  return style?.render_key || style?.name || "regular";
+}
+
+/**
+ * Default wall mode ("enclosed" | "open") for a metal_s_style row: the DB
+ * has_walls flag, except the Loafing Shed, whose storage room + open stall
+ * look needs enclosed walls — it always starts "enclosed" (reference order).
+ */
+export function getDefaultWallMode(style) {
+  if (resolveStyleKey(style) === "loafing_shed") return "enclosed";
+  return style?.has_walls ? "enclosed" : "open";
+}
+
+/**
+ * Get the full style profile by render_key.
+ */
+export function getStyleProfile(renderKey) {
+  if (!renderKey) return DEFAULT_PROFILE;
+  const key = renderKey.toLowerCase().replace(/[-\s]/g, "_");
+  if (PROFILES[key]) return PROFILES[key];
+  // Free Standing Lean To — accept the canonical key plus DB render_key
+  // variants ("leanto", "lean_to", "freestanding_leanto", ...). Checked before
+  // the generic chain; the lean-to terms are exact keys only (never a bare
+  // "leanto*" substring match) so styles like "wraparound_leantos" or
+  // "loafing_shed" never resolve here.
+  const isFreeStandingKey =
+    key.includes("free_standing") ||
+    key.includes("freestanding") ||
+    key === "leanto" ||
+    key === "lean_to";
+  if (isFreeStandingKey) {
+    return PROFILES.free_standing_lean_to;
+  }
+  // Loafing Shed — canonical key plus loose variants ("loafing", "loafing_shed",
+  // "loafing_shed_style", ...). Checked before the generic chain so "shed"-style
+  // keys never fall through to a wrong profile.
+  if (key.includes("loafing")) {
+    return PROFILES.loafing_shed;
+  }
+  if (key.includes("commercial")) return PROFILES.commercial;
+  if (key.includes("rib")) return PROFILES.rib_type;
+  if (key.includes("truss")) return PROFILES.truss;
+  if (key.includes("vertical")) return PROFILES.aframe_vertical;
+  if (key.includes("regular") || (key.includes("carport") && !key.includes("aframe") && !key.includes("a_frame"))) return PROFILES.regular;
+  if (key.includes("step")) return PROFILES.step_down_barn;
+  if (key.includes("barn")) return PROFILES.barn;
+  if (key.includes("garage")) return PROFILES.garage;
+  if (key.includes("aframe") || key.includes("a_frame")) return PROFILES.aframe;
+  return DEFAULT_PROFILE;
+}
+
+/**
+ * Check if a feature (by render_key) is allowed for a style profile.
+ */
+export function isFeatureAllowed(profile, featureRenderKey) {
+  if (!featureRenderKey) return true;
+  return !profile.blockedFeatures?.includes(featureRenderKey);
+}
+
+/**
+ * Check if an accessory type (door, window, etc.) is allowed for a style profile.
+ */
+export function isAccessoryAllowed(profile, itemType) {
+  if (profile.allowedAccessories === null) return true;
+  return profile.allowedAccessories.includes(itemType);
+}
+
+export default PROFILES;

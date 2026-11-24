@@ -1,0 +1,569 @@
+/**
+ * Metal Master Data Config - Region + Zip Code data layer (client-safe utilities)
+ *
+ * Pure helpers shared between page and view:
+ * - Model helpers (normalization, display)
+ * - Utility functions
+ * - Batch save orchestration (via Server Actions)
+ */
+
+import {
+  createRegionAction,
+  updateRegionAction,
+  deactivateRegionAction,
+  hardDeleteRegionAction,
+  createZipCodeAction,
+  updateZipCodeAction,
+  hardDeleteZipCodeAction,
+  createCategoryAction,
+  updateCategoryAction,
+  deactivateCategoryAction,
+  hardDeleteCategoryAction,
+  createPanelTypeAction,
+  updatePanelTypeAction,
+  hardDeletePanelTypeAction,
+  createStyleAction,
+  updateStyleAction,
+  deactivateStyleAction,
+  hardDeleteStyleAction,
+  createCustomAdjustmentAction,
+  updateCustomAdjustmentAction,
+  deactivateCustomAdjustmentAction,
+  hardDeleteCustomAdjustmentAction,
+} from "./metalMasterDataConfig.actions.js";
+
+// --- REGION MODEL HELPERS ---
+
+export function isRegionActive(region) {
+  if (region?.is_active === false || region?.is_active === 0) return false;
+  const text = String(region?.is_active ?? "").trim().toLowerCase();
+  return !(text === "false" || text === "0" || text === "f" || text === "n" || text === "no");
+}
+
+export function getRegionName(region) {
+  return region?.name ?? "Unknown";
+}
+
+export function getRegionStateCode(region) {
+  return region?.state_code ?? "--";
+}
+
+export function getRegionMultiplier(region) {
+  const value = Number(region?.multiplier);
+  return Number.isFinite(value) ? value : 1;
+}
+
+export function mapRegionRow(region, index) {
+  return {
+    ...region,
+    id: region?.region_id ?? `region-${index}`,
+    name: getRegionName(region),
+    state_code: getRegionStateCode(region),
+    multiplier: getRegionMultiplier(region),
+    is_active_bool: isRegionActive(region),
+  };
+}
+
+// --- ZIP CODE MODEL HELPERS ---
+
+export function getZipCode(z) {
+  return String(z?.zip_code ?? "").trim();
+}
+
+export function getZipRegionId(z) {
+  return z?.region_id ?? null;
+}
+
+export function getZipRegionName(z) {
+  return z?.metal_s_region?.name || z?.region_name || "";
+}
+
+export function getZipRegionStateCode(z) {
+  return z?.metal_s_region?.state_code || z?.region_state_code || "";
+}
+
+export function getZipCity(z) {
+  return z?.city ?? "";
+}
+
+export function getZipCounty(z) {
+  return z?.county ?? "";
+}
+
+export function getZipLatitude(z) {
+  const value = Number(z?.latitude);
+  return Number.isFinite(value) ? value : null;
+}
+
+export function getZipLongitude(z) {
+  const value = Number(z?.longitude);
+  return Number.isFinite(value) ? value : null;
+}
+
+export function getZipTimezone(z) {
+  return z?.timezone ?? "";
+}
+
+export function mapZipCodeRow(zipCode, index) {
+  return {
+    ...zipCode,
+    id: zipCode?.zip_code ?? `zip-${index}`,
+    zip_code: getZipCode(zipCode),
+    region_id: getZipRegionId(zipCode),
+    region_name: getZipRegionName(zipCode),
+    region_state_code: getZipRegionStateCode(zipCode),
+    city: getZipCity(zipCode),
+    county: getZipCounty(zipCode),
+    latitude: getZipLatitude(zipCode),
+    longitude: getZipLongitude(zipCode),
+    timezone: getZipTimezone(zipCode),
+  };
+}
+
+// --- CATEGORY MODEL HELPERS ---
+
+export function isCategoryActive(category) {
+  if (category?.is_active === false || category?.is_active === 0) return false;
+  const text = String(category?.is_active ?? "").trim().toLowerCase();
+  return !(text === "false" || text === "0" || text === "f" || text === "n" || text === "no");
+}
+
+export function getCategoryName(category) {
+  return category?.name ?? "";
+}
+
+export function getCategoryDescription(category) {
+  return category?.description ?? "";
+}
+
+export function getCategorySortOrder(category) {
+  const value = Number(category?.sort_order);
+  return Number.isFinite(value) ? value : 0;
+}
+
+export function mapCategoryRow(category, index) {
+  return {
+    ...category,
+    id: category?.category_id ?? `category-${index}`,
+    name: getCategoryName(category),
+    description: getCategoryDescription(category),
+    sort_order: getCategorySortOrder(category),
+    is_active_bool: isCategoryActive(category),
+  };
+}
+
+// --- CUSTOM ADJUSTMENT MODEL HELPERS ---
+
+export function mapCustomAdjustmentRow(row, index) {
+  const sort = Number(row?.sort);
+  return {
+    ...row,
+    id: row?.id ?? `custom-adjustment-${index}`,
+    option_name: row?.option_name ?? "",
+    option_desctiption: row?.option_desctiption ?? "",
+    sort: Number.isFinite(sort) ? sort : 0,
+    is_active_bool: isCategoryActive(row), // same is_active rules (null → active)
+  };
+}
+
+// --- PANEL TYPE MODEL HELPERS ---
+
+export function getPanelTypeName(panelType) {
+  return panelType?.panel_name ?? "";
+}
+
+export function getPanelTypeDescription(panelType) {
+  return panelType?.panel_description ?? "";
+}
+
+export function getPanelTypeLocationType(panelType) {
+  return panelType?.location_type ?? "";
+}
+
+export function getPanelTypeSortOrder(panelType) {
+  const value = Number(panelType?.sort_order);
+  return Number.isFinite(value) ? value : 0;
+}
+
+export function mapPanelTypeRow(panelType, index) {
+  return {
+    ...panelType,
+    id: panelType?.panel_type_id ?? `panel-type-${index}`,
+    panel_name: getPanelTypeName(panelType),
+    panel_description: getPanelTypeDescription(panelType),
+    location_type: getPanelTypeLocationType(panelType),
+    sort_order: getPanelTypeSortOrder(panelType),
+  };
+}
+
+// --- STYLE MODEL HELPERS ---
+
+export function isStyleActive(style) {
+  if (style?.is_active === false || style?.is_active === 0) return false;
+  const text = String(style?.is_active ?? "").trim().toLowerCase();
+  return !(text === "false" || text === "0" || text === "f" || text === "n" || text === "no");
+}
+
+export function getStyleName(style) {
+  return style?.name ?? "";
+}
+
+export function getStyleDescription(style) {
+  return style?.description ?? "";
+}
+
+export function getStyleSortOrder(style) {
+  const value = Number(style?.sort_order);
+  return Number.isFinite(value) ? value : 0;
+}
+
+export function getStyleRenderKey(style) {
+  return style?.render_key ?? "";
+}
+
+export function getStyleDefaultRoofPitch(style) {
+  const value = Number(style?.default_roof_pitch);
+  return Number.isFinite(value) ? value : 0.25;
+}
+
+export function getStyleDefaultWidth(style) {
+  const value = Number(style?.default_width);
+  return Number.isFinite(value) ? value : 12;
+}
+
+export function getStyleDefaultLength(style) {
+  const value = Number(style?.default_length);
+  return Number.isFinite(value) ? value : 20;
+}
+
+export function getStyleDefaultHeight(style) {
+  const value = Number(style?.default_height);
+  return Number.isFinite(value) ? value : 6;
+}
+
+export function getStyleDefaultRoofOverhang(style) {
+  const text = String(style?.default_roof_overhang ?? "").trim();
+  return text === "" ? "0" : text;
+}
+
+export function getStyleHasWalls(style) {
+  if (style?.has_walls === true || style?.has_walls === 1) return true;
+  const text = String(style?.has_walls ?? "").trim().toLowerCase();
+  return text === "true" || text === "1" || text === "t" || text === "y" || text === "yes";
+}
+
+export function getStyleIconPath(style) {
+  return style?.icon_path ?? "";
+}
+
+export function mapStyleRow(style, index) {
+  return {
+    ...style,
+    id: style?.style_id ?? `style-${index}`,
+    name: getStyleName(style),
+    description: getStyleDescription(style),
+    sort_order: getStyleSortOrder(style),
+    render_key: getStyleRenderKey(style),
+    default_roof_pitch: getStyleDefaultRoofPitch(style),
+    default_width: getStyleDefaultWidth(style),
+    default_length: getStyleDefaultLength(style),
+    default_height: getStyleDefaultHeight(style),
+    default_roof_overhang: getStyleDefaultRoofOverhang(style),
+    has_walls_bool: getStyleHasWalls(style),
+    icon_path: getStyleIconPath(style),
+    is_active_bool: isStyleActive(style),
+  };
+}
+
+// --- UTILITY HELPERS ---
+
+export function isSameId(left, right) {
+  return String(left ?? "") === String(right ?? "");
+}
+
+export function compareText(left, right) {
+  return String(left || "").localeCompare(String(right || ""), undefined, {
+    sensitivity: "base",
+    numeric: true,
+  });
+}
+
+export function normalizeText(value) {
+  return String(value ?? "").trim();
+}
+
+export function removeObjectKey(objectValue, keyToRemove) {
+  const normalizedKey = String(keyToRemove ?? "");
+  const nextObject = {};
+  Object.entries(objectValue || {}).forEach(([key, value]) => {
+    if (key !== normalizedKey) {
+      nextObject[key] = value;
+    }
+  });
+  return nextObject;
+}
+
+export function mergeUpdatePatch(previousPatch, nextPatch) {
+  const mergedPatch = { ...(previousPatch || {}) };
+  Object.entries(nextPatch || {}).forEach(([key, value]) => {
+    if (value !== undefined) {
+      mergedPatch[key] = value;
+    }
+  });
+  return mergedPatch;
+}
+
+export function appendUniqueId(idList, value) {
+  const normalizedValue = String(value ?? "");
+  if (!normalizedValue) return Array.isArray(idList) ? [...idList] : [];
+  const existing = Array.isArray(idList) ? idList : [];
+  if (existing.some((entry) => isSameId(entry, normalizedValue))) return [...existing];
+  return [...existing, normalizedValue];
+}
+
+export const EMPTY_DIALOG = { kind: null, target: null, nextIsActive: null };
+export const TEMP_REGION_PREFIX = "tmp-region-";
+export const TEMP_CATEGORY_PREFIX = "tmp-category-";
+export const TEMP_PANEL_TYPE_PREFIX = "tmp-panel-type-";
+export const TEMP_STYLE_PREFIX = "tmp-style-";
+export const TEMP_CUSTOM_ADJUSTMENT_PREFIX = "tmp-custom-adjustment-";
+
+export function isTempCustomAdjustmentId(value) {
+  return String(value ?? "").startsWith(TEMP_CUSTOM_ADJUSTMENT_PREFIX);
+}
+
+export function createEmptyCustomAdjustmentChanges() {
+  return { creates: [], updates: {}, deactivations: [], hardDeletes: [] };
+}
+
+export function createTempId(prefix) {
+  return `${prefix}${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+export function isTempRegionId(value) {
+  return String(value ?? "").startsWith(TEMP_REGION_PREFIX);
+}
+
+export function isTempCategoryId(value) {
+  return String(value ?? "").startsWith(TEMP_CATEGORY_PREFIX);
+}
+
+export function isTempPanelTypeId(value) {
+  return String(value ?? "").startsWith(TEMP_PANEL_TYPE_PREFIX);
+}
+
+export function isTempStyleId(value) {
+  return String(value ?? "").startsWith(TEMP_STYLE_PREFIX);
+}
+
+export function createEmptyRegionChanges() {
+  return { creates: [], updates: {}, deactivations: [], hardDeletes: [] };
+}
+
+export function createEmptyZipCodeChanges() {
+  return { creates: [], updates: {}, deletes: [] };
+}
+
+export function createEmptyCategoryChanges() {
+  return { creates: [], updates: {}, deactivations: [], hardDeletes: [] };
+}
+
+export function createEmptyPanelTypeChanges() {
+  return { creates: [], updates: {}, deletes: [] };
+}
+
+export function createEmptyStyleChanges() {
+  return { creates: [], updates: {}, deactivations: [], hardDeletes: [] };
+}
+
+// --- BATCH SAVE (calls Server Actions) ---
+
+export async function executeRegionBatchSave(regionChanges) {
+  const deactivatedSet = new Set(
+    [...(regionChanges.deactivations || []), ...(regionChanges.hardDeletes || [])].map((id) => String(id ?? "")),
+  );
+  const tempIdMap = new Map();
+
+  for (const createEntry of regionChanges.creates || []) {
+    const created = await createRegionAction(createEntry.payload);
+    const createdId = created?.region_id;
+    if (createdId === undefined || createdId === null || createdId === "") {
+      throw new Error("Created region response is invalid.");
+    }
+    tempIdMap.set(String(createEntry.tempId), createdId);
+  }
+
+  for (const [regionId, updates] of Object.entries(regionChanges.updates || {})) {
+    const resolvedRegionId = tempIdMap.get(String(regionId)) ?? regionId;
+    if (deactivatedSet.has(String(resolvedRegionId))) continue;
+    if (isTempRegionId(resolvedRegionId)) continue;
+    if (Object.keys(updates || {}).length === 0) continue;
+    await updateRegionAction(resolvedRegionId, updates);
+  }
+
+  for (const regionId of regionChanges.deactivations || []) {
+    const resolvedRegionId = tempIdMap.get(String(regionId)) ?? regionId;
+    if (isTempRegionId(resolvedRegionId)) continue;
+    await deactivateRegionAction(resolvedRegionId);
+  }
+
+  for (const regionId of regionChanges.hardDeletes || []) {
+    const resolvedRegionId = tempIdMap.get(String(regionId)) ?? regionId;
+    if (isTempRegionId(resolvedRegionId)) continue;
+    await hardDeleteRegionAction(resolvedRegionId);
+  }
+}
+
+export async function executeZipCodeBatchSave(zipCodeChanges) {
+  const deletedSet = new Set((zipCodeChanges.deletes || []).map((id) => String(id ?? "")));
+
+  for (const createEntry of zipCodeChanges.creates || []) {
+    await createZipCodeAction(createEntry.payload);
+  }
+
+  for (const [zipCode, updates] of Object.entries(zipCodeChanges.updates || {})) {
+    if (deletedSet.has(String(zipCode))) continue;
+    if (Object.keys(updates || {}).length === 0) continue;
+    await updateZipCodeAction(zipCode, updates);
+  }
+
+  for (const zipCode of zipCodeChanges.deletes || []) {
+    await hardDeleteZipCodeAction(zipCode);
+  }
+}
+
+export async function executeCategoryBatchSave(categoryChanges) {
+  const deactivatedSet = new Set(
+    [...(categoryChanges.deactivations || []), ...(categoryChanges.hardDeletes || [])].map((id) => String(id ?? "")),
+  );
+  const tempIdMap = new Map();
+
+  for (const createEntry of categoryChanges.creates || []) {
+    const created = await createCategoryAction(createEntry.payload);
+    const createdId = created?.category_id;
+    if (createdId === undefined || createdId === null || createdId === "") {
+      throw new Error("Created category response is invalid.");
+    }
+    tempIdMap.set(String(createEntry.tempId), createdId);
+  }
+
+  for (const [categoryId, updates] of Object.entries(categoryChanges.updates || {})) {
+    const resolvedCategoryId = tempIdMap.get(String(categoryId)) ?? categoryId;
+    if (deactivatedSet.has(String(resolvedCategoryId))) continue;
+    if (isTempCategoryId(resolvedCategoryId)) continue;
+    if (Object.keys(updates || {}).length === 0) continue;
+    await updateCategoryAction(resolvedCategoryId, updates);
+  }
+
+  for (const categoryId of categoryChanges.deactivations || []) {
+    const resolvedCategoryId = tempIdMap.get(String(categoryId)) ?? categoryId;
+    if (isTempCategoryId(resolvedCategoryId)) continue;
+    await deactivateCategoryAction(resolvedCategoryId);
+  }
+
+  for (const categoryId of categoryChanges.hardDeletes || []) {
+    const resolvedCategoryId = tempIdMap.get(String(categoryId)) ?? categoryId;
+    if (isTempCategoryId(resolvedCategoryId)) continue;
+    await hardDeleteCategoryAction(resolvedCategoryId);
+  }
+}
+
+export async function executeCustomAdjustmentBatchSave(changes) {
+  const deactivatedSet = new Set(
+    [...(changes.deactivations || []), ...(changes.hardDeletes || [])].map((id) => String(id ?? "")),
+  );
+  const tempIdMap = new Map();
+
+  for (const createEntry of changes.creates || []) {
+    const created = await createCustomAdjustmentAction(createEntry.payload);
+    const createdId = created?.id;
+    if (createdId === undefined || createdId === null || createdId === "") {
+      throw new Error("Created custom adjustment response is invalid.");
+    }
+    tempIdMap.set(String(createEntry.tempId), createdId);
+  }
+
+  for (const [id, updates] of Object.entries(changes.updates || {})) {
+    const resolvedId = tempIdMap.get(String(id)) ?? id;
+    if (deactivatedSet.has(String(resolvedId))) continue;
+    if (isTempCustomAdjustmentId(resolvedId)) continue;
+    if (Object.keys(updates || {}).length === 0) continue;
+    await updateCustomAdjustmentAction(resolvedId, updates);
+  }
+
+  for (const id of changes.deactivations || []) {
+    const resolvedId = tempIdMap.get(String(id)) ?? id;
+    if (isTempCustomAdjustmentId(resolvedId)) continue;
+    await deactivateCustomAdjustmentAction(resolvedId);
+  }
+
+  for (const id of changes.hardDeletes || []) {
+    const resolvedId = tempIdMap.get(String(id)) ?? id;
+    if (isTempCustomAdjustmentId(resolvedId)) continue;
+    await hardDeleteCustomAdjustmentAction(resolvedId);
+  }
+}
+
+export async function executePanelTypeBatchSave(panelTypeChanges) {
+  const deletedSet = new Set((panelTypeChanges.deletes || []).map((id) => String(id ?? "")));
+  const tempIdMap = new Map();
+
+  for (const createEntry of panelTypeChanges.creates || []) {
+    const created = await createPanelTypeAction(createEntry.payload);
+    const createdId = created?.panel_type_id;
+    if (createdId === undefined || createdId === null || createdId === "") {
+      throw new Error("Created panel type response is invalid.");
+    }
+    tempIdMap.set(String(createEntry.tempId), createdId);
+  }
+
+  for (const [panelTypeId, updates] of Object.entries(panelTypeChanges.updates || {})) {
+    const resolvedPanelTypeId = tempIdMap.get(String(panelTypeId)) ?? panelTypeId;
+    if (deletedSet.has(String(resolvedPanelTypeId))) continue;
+    if (isTempPanelTypeId(resolvedPanelTypeId)) continue;
+    if (Object.keys(updates || {}).length === 0) continue;
+    await updatePanelTypeAction(resolvedPanelTypeId, updates);
+  }
+
+  for (const panelTypeId of panelTypeChanges.deletes || []) {
+    const resolvedPanelTypeId = tempIdMap.get(String(panelTypeId)) ?? panelTypeId;
+    if (isTempPanelTypeId(resolvedPanelTypeId)) continue;
+    await hardDeletePanelTypeAction(resolvedPanelTypeId);
+  }
+}
+
+export async function executeStyleBatchSave(styleChanges) {
+  const deactivatedSet = new Set(
+    [...(styleChanges.deactivations || []), ...(styleChanges.hardDeletes || [])].map((id) => String(id ?? "")),
+  );
+  const tempIdMap = new Map();
+
+  for (const createEntry of styleChanges.creates || []) {
+    const created = await createStyleAction(createEntry.payload);
+    const createdId = created?.style_id;
+    if (createdId === undefined || createdId === null || createdId === "") {
+      throw new Error("Created style response is invalid.");
+    }
+    tempIdMap.set(String(createEntry.tempId), createdId);
+  }
+
+  for (const [styleId, updates] of Object.entries(styleChanges.updates || {})) {
+    const resolvedStyleId = tempIdMap.get(String(styleId)) ?? styleId;
+    if (deactivatedSet.has(String(resolvedStyleId))) continue;
+    if (isTempStyleId(resolvedStyleId)) continue;
+    if (Object.keys(updates || {}).length === 0) continue;
+    await updateStyleAction(resolvedStyleId, updates);
+  }
+
+  for (const styleId of styleChanges.deactivations || []) {
+    const resolvedStyleId = tempIdMap.get(String(styleId)) ?? styleId;
+    if (isTempStyleId(resolvedStyleId)) continue;
+    await deactivateStyleAction(resolvedStyleId);
+  }
+
+  for (const styleId of styleChanges.hardDeletes || []) {
+    const resolvedStyleId = tempIdMap.get(String(styleId)) ?? styleId;
+    if (isTempStyleId(resolvedStyleId)) continue;
+    await hardDeleteStyleAction(resolvedStyleId);
+  }
+}
